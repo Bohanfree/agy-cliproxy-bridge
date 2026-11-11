@@ -1,5 +1,9 @@
 # NOTICE：来源与合规说明
 
+## 本适配器的后续补丁（2026-11-11，v0.1.1）
+
+`index.mjs` 新增工具结果与后续用户指令／助手预填的边界恢复：允许在完整工具结果后继续摘要或续写，保留原始消息与结果，在新会话中重放；不完整并行结果仍保留原等待状态。原基线及本地补丁校验值见上层 `vendor/provenance.json`。以下上游来源说明与版权保留。
+
 本包（`@magpie-community/opencode-agy-cli-auth`，版本 0.1.0）源自 Antigravity 桥接插件
 `opencode-antigravity-bridge`，由 gitxm 整理为 `gitxm/yce-magpie-agy` 后提交到
 magpie-community/plugins（plugins#785），以 MIT 协议发布。**与上游无隶属关系。** 上游版权声明原样保留在 [LICENSE](LICENSE)，

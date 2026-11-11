@@ -34,9 +34,10 @@ test('keeps tool call identity, results and a following user instruction in orde
     {role: 'user', content: 'Now write a summary'},
   ], tools: [{type: 'function', function: {name: 'read_file', parameters: {type: 'object', properties: {path: {type: 'string'}}}}}]});
   assert.equal(body.system[0].text, 'Work on the Mac');
-  assert.equal(body.messages.length, 3);
+  assert.equal(body.messages.length, 4);
   assert.equal(body.messages[1].content[0].input.path, '/Users/demo/a.txt');
-  assert.deepEqual(body.messages[2].content.map(p => p.type), ['tool_result', 'text']);
+  assert.deepEqual(body.messages[2].content.map(p => p.type), ['tool_result']);
+  assert.deepEqual(body.messages[3].content, [{type: 'text', text: 'Now write a summary'}]);
   assert.equal(body.messages[2].content[0].tool_use_id, 'call_1');
   assert.equal(body.messages[2].content[0].content[0].text, 'unique-marker-123');
 });

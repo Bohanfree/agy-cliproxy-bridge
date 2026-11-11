@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.1.1
+
+- Preserve the boundary between OpenAI tool results and following user instructions.
+- Resume requests containing completed tool results plus inline instructions,
+  a follow-up user message, or an assistant prefill. Retire the pending ACP
+  turn and replay the completed results with the new instruction once.
+- Keep ordinary tool-result continuations on the existing session and reject
+  incomplete parallel tool batches without abandoning their pending owner.
+- Add regressions against the actual ACP bridge for streaming, JSON, restored
+  histories and compaction with tools removed. The isolated AGY fixture executes
+  no real model requests.
+
 ## 0.1.0
 
 - First public release of the AGY ACP to CLIProxyAPI HTTP adapter.

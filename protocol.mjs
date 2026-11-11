@@ -27,7 +27,11 @@ export function chatToMessages(body) {
   const append = (role, content) => {
     if (!content.length) return;
     const last = messages.at(-1);
-    if (last?.role === role) last.content.push(...content);
+    // Keep user instructions separate from tool results. The ACP bridge uses
+    // that boundary to distinguish an MCP continuation from a new user turn.
+    const toolResultsOnly = parts => parts.every(part => part.type === 'tool_result');
+    if (last?.role === role && (role === 'assistant' ||
+      (toolResultsOnly(last.content) && toolResultsOnly(content)))) last.content.push(...content);
     else messages.push({role, content});
   };
   for (const message of body.messages) {

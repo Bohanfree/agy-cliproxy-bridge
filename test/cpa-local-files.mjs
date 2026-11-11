@@ -76,5 +76,47 @@ const streamedCall = completed.response.output.find(i => i.type === 'function_ca
 assert.equal(streamedCall.name, 'read_file');
 assert.equal(JSON.parse(streamedCall.arguments).path, expected.input);
 evidence.push({test: 'responses_streaming_tool_call', passed: true});
+// These requests go through CPA, the HTTP adapter and the real ACP bridge.
+// Only the external AGY process is simulated. Completed client results must
+// reach the new prompt without emitting the already-completed tool again.
+for (const streaming of [false, true]) {
+  for (const tail of ['user', 'assistant']) {
+    const marker = `CPA_CONTINUATION_${randomUUID()}`;
+    const messages = [{role: 'user', content: JSON.stringify({input: '/completed-input', output: '/unused-output'})}];
+    const first = await (await request('/chat/completions', {model: 'agy-gemini-3.8-flash', messages, tools, stream: false})).json();
+    const message = first.choices[0].message;
+    assert.equal(message.tool_calls?.length, 1);
+    messages.push(message, {role: 'tool', tool_call_id: message.tool_calls[0].id, content: marker},
+      {role: tail, content: tail === 'user' ? 'FOLLOWUP_MARKER summarize the completed result' : 'PREFILL_MARKER The completed result is:'});
+    const response = await request('/chat/completions', {model: 'agy-gemini-3.8-flash', messages, tools, stream: streaming});
+    let finalText;
+    if (streaming) {
+      const chunks = await Array.fromAsync(parseSSE(response.body));
+      assert.ok(chunks.every(e => !e.choices?.[0]?.delta?.tool_calls?.length));
+      assert.ok(chunks.some(e => e.choices?.[0]?.finish_reason === 'stop'));
+      finalText = chunks.map(e => e.choices?.[0]?.delta?.content || '').join('');
+    } else {
+      const result = (await response.json()).choices[0];
+      assert.equal(result.finish_reason, 'stop');
+      assert.ok(!result.message.tool_calls?.length);
+      finalText = result.message.content;
+    }
+    assert.ok(finalText.includes(`CONTINUATION_OK ${marker}`));
+    evidence.push({test: `core_chat_${streaming ? 'stream' : 'json'}_result_${tail}`, passed: true});
+  }
+}
+for (const tail of ['user', 'assistant']) {
+  const marker = `CPA_CONTINUATION_${randomUUID()}`;
+  const input = [{role: 'user', content: JSON.stringify({input: '/completed-input', output: '/unused-output'})}];
+  const first = await (await request('/responses', {model: 'agy-gemini-3.8-flash', input, tools: responseTools, stream: false})).json();
+  const call = first.output.find(item => item.type === 'function_call');
+  assert.ok(call);
+  input.push(...first.output, {type: 'function_call_output', call_id: call.call_id, output: marker},
+    {role: tail, content: tail === 'user' ? 'FOLLOWUP_MARKER summarize existing results' : 'PREFILL_MARKER The summary is:'});
+  const result = await (await request('/responses', {model: 'agy-gemini-3.8-flash', input, tools: responseTools, stream: false})).json();
+  assert.ok(result.output.every(item => item.type !== 'function_call'));
+  assert.ok(JSON.stringify(result.output).includes(`CONTINUATION_OK ${marker}`));
+  evidence.push({test: `core_responses_result_${tail}`, passed: true});
+}
 await fs.writeFile('.artifacts/offline-integration.json', JSON.stringify({kind: 'DETERMINISTIC_PROTOCOL_FIXTURE_NOT_REAL_MODEL', evidence}, null, 2));
 console.log(JSON.stringify(evidence, null, 2));

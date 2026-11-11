@@ -2669,8 +2669,8 @@ function assistantTextOf(message) {
 // run: runStart = first message of the trailing text-only assistant run,
 // boundary = history split point (after the last assistant message before the
 // run, the session ledger's newest entry). Returns null when the request does
-// not end with a text-only assistant run. Known limits: a request combining a
-// live tool_result with a prefill tail is rejected in validateBody; a run with
+// not end with a text-only assistant run. A tool result followed by a prefill
+// is replayed with its completed results in a fresh session. A run with
 // no user message before it (contiguous assistant tail, e.g. a client re-sending
 // a completed reply with a prefill appended) puts the whole run in the tail, so
 // that one turn degrades to a fresh session (safe, self-healing).
@@ -3497,9 +3497,6 @@ function validateBody(body) {
   // A text-only assistant tail is a client-side prefill (see prefillRun).
   const prefillTail = prefillTailEnabled() && lastRole === "assistant" && assistantTextOf(body.messages.at(-1)) !== null
   const validTailRole = lastRole === "user" || lastRole === "system" || lastRole === "developer" || prefillTail
-  if (prefillTail && extractToolResults(body).length) {
-    throw new UnsupportedContent("a request combining a live tool_result with an assistant prefill tail")
-  }
   if (!validTailRole || (!extractToolResults(body).length &&
     !trailing.messages.some((message) => message.role === "user") && !trailing.history.length)) {
     throw new UnsupportedContent(prefillTail
@@ -3785,31 +3782,45 @@ function withContextNotices(results, body) {
   return inspectToolTurn(results, body).results
 }
 
-// When a previous tool-result HTTP request failed or was aborted before producing
-// an assistant message, and the user subsequently enters a new standalone user
-// message after the tool_result message, replay in a fresh session instead of
-// wedging the conversation with HTTP 400.
+// Follow-up instructions and assistant prefills cannot be sent as the result of
+// an MCP call. Once the complete result batch has been validated, replay it with
+// the follow-up in a fresh session. Clients may put the follow-up in the same
+// user content array as the results, or in a separate user/assistant message.
+// Keep the original body for replay; the split below only validates the boundary.
 function canReplayFollowUpAfterResults(body, rawResults) {
+  // A follow-up must not discard the unanswered half of a parallel tool batch.
+  if (replayHistoryProblem(body, rawResults.map((item) => item.block))) return false
   const { history, messages } = trailingMessages(body)
   let lastResultIndex = -1
+  let lastResultBlock = -1
   for (let i = 0; i < messages.length; i++) {
     const message = messages[i]
-    if (message.role === "user" && Array.isArray(message.content) &&
-      message.content.some((block) => block?.type === "tool_result")) {
-      lastResultIndex = i
+    if (message.role === "user" && Array.isArray(message.content)) {
+      for (let j = 0; j < message.content.length; j++) {
+        if (message.content[j]?.type !== "tool_result") continue
+        lastResultIndex = i
+        lastResultBlock = j
+      }
     }
   }
-  if (lastResultIndex < 0 || lastResultIndex >= messages.length - 1) return false
+  if (lastResultIndex < 0) return false
+  const resultMessage = messages[lastResultIndex]
+  const prefix = [...messages.slice(0, lastResultIndex), {
+    ...resultMessage, content: resultMessage.content.slice(0, lastResultBlock + 1),
+  }]
   const tail = messages.slice(lastResultIndex + 1)
-  if (!tail.some((message) => message.role === "user")) return false
+  const inlineTail = resultMessage.content.slice(lastResultBlock + 1)
+  if (inlineTail.length) tail.unshift({ ...resultMessage, content: inlineTail })
+  if (!tail.some((message) => message.role === "user" ||
+    (prefillTailEnabled() && assistantTextOf(message) !== null))) return false
   try {
-    withContextNotices(rawResults, { ...body, messages: [...history, ...messages.slice(0, lastResultIndex + 1)] })
+    withContextNotices(rawResults, { ...body, messages: [...history, ...prefix] })
+    for (const message of tail) {
+      const rest = messageText(message).replace(CONTEXT_NOTICE_RE, "").replace(SYSTEM_REMINDER_RE, "")
+      if (UNCLOSED_NOTICE_RE.test(rest)) return false
+    }
   } catch {
     return false
-  }
-  for (const message of tail) {
-    const rest = messageText(message).replace(CONTEXT_NOTICE_RE, "").replace(SYSTEM_REMINDER_RE, "")
-    if (UNCLOSED_NOTICE_RE.test(rest)) return false
   }
   return true
 }

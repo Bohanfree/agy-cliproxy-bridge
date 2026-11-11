@@ -4,9 +4,10 @@ services:
   fixture:
     image: node:22-bookworm-slim
     working_dir: /app
-    command: ["node", "test/fixture.mjs"]
+    command: ["node", "--experimental-vm-modules", "test/fixture.mjs"]
     user: "1000:1000"
     read_only: true
+    tmpfs: ["/tmp:rw,exec,size=32m,mode=1777"]
     mem_limit: 128m
     volumes: ["./:/app:ro"]
     environment: {BIND: 0.0.0.0, PORT: "9438"}
