@@ -1,0 +1,18 @@
+{
+  "name": "agy-cliproxy-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Connect the real Antigravity CLI ACP to CLIProxyAPI through an OpenAI-compatible HTTP adapter.",
+  "type": "module",
+  "license": "MIT",
+  "repository": {"type": "git", "url": "git+https://github.com/Bohanfree/agy-cliproxy-bridge.git"},
+  "scripts": {
+    "start": "sh scripts/start.sh",
+    "login": "node --env-file-if-exists=.env login.mjs",
+    "init": "node scripts/init.mjs",
+    "test": "node --test test/*.test.mjs",
+    "test:cpa": "node test/cpa-local-files.mjs"
+  },
+  "engines": {"node": ">=22.22.0"},
+  "keywords": ["antigravity", "agy", "acp", "cliproxyapi", "openai-compatible"]
+}

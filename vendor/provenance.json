@@ -1,0 +1,20 @@
+{
+  "sha256": {
+    "index.mjs": "db40414c59f84a339406a70f12bcb490ceacc332b87298d8090b7197be6c2619",
+    "platform.mjs": "ddaae7b777fd556f58755408348439b46a13a5c38dd5b10c296c93c515d5051a",
+    "usage.mjs": "e9972f15b3975cdf0b35e97b179ba4e149a5779c604ea5c30049846da742e4df",
+    "login.mjs": "8fc1aa0cd4f6b341db63a4916c3e0d405b9c325651c8fa2d560b1215fe5f4d78",
+    "mcp-server.mjs": "b0ef3568cc4361108c3db2c7bde8e02646b6a7b8610b015e0e8f129e32f0f926",
+    "package.json": "d7029c114cd3acffd5d30924a39994a66c12ce95181d26829ec5fdb4c1db364a",
+    "LICENSE": "46f74979a7382f51ececa310eb3f3bd2a04addcd2b4dc3e27721c8eada0a07bd",
+    "NOTICE.md": "3a3df6156e5665e9b1be2c023e088834bc2f467b6c1f9d91800214bedd3b06ff"
+  },
+  "upstream": {
+    "repository": "https://github.com/magpie-community/plugins",
+    "directory": "packages/agy-cli",
+    "package": "@magpie-community/opencode-agy-cli-auth",
+    "version": "0.1.3",
+    "notice": "agy-bridge/NOTICE.md"
+  },
+  "baseline": "Vendored patched MIT bridge; original file hashes preserved below."
+}

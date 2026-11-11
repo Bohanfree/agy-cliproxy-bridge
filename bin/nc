@@ -1,0 +1,5 @@
+#!/bin/sh
+set -eu
+# Keep a persistent MCP launcher when agy rebuilds PATH during tool startup.
+ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+exec "${AGY_BRIDGE_NODE:-node}" "$ROOT/vendor/agy-bridge/mcp-server.mjs"

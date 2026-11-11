@@ -1,0 +1,54 @@
+# Advanced mode: reuse an existing signed-in Linux AGY/Magpie environment.
+# For a standalone host installation, use npm start instead.
+name: agy-cliproxy
+services:
+  bridge:
+    image: ghcr.io/yetone/magpie@sha256:446e3d82ec3013b9cfd2795dbb79303942610365c026f567588f43122ffbf1a3
+    user: "65532:65532"
+    entrypoint: ["${BUN_PATH:-/config/cache/magpie/bun/1.4.4/magpie-bun}", "/app/server.mjs"]
+    working_dir: /app
+    restart: unless-stopped
+    mem_limit: 896m
+    cpus: 1.0
+    pids_limit: 128
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    tmpfs: ["/tmp:rw,size=96m,mode=1777"]
+    ports: ["127.0.0.1:${BRIDGE_HOST_PORT:-19437}:9437"]
+    networks: [cpa]
+    environment:
+      BIND: 0.0.0.0
+      PORT: "9437"
+      PATH: /app/bin:/config/home/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+      HOME: /config/home
+      XDG_CONFIG_HOME: /config
+      XDG_DATA_HOME: /config/data
+      DBUS_SESSION_BUS_ADDRESS: unix:path=/config/agy-keyring-runtime/bus
+      AGY_PATH: /config/home/.local/bin/agy
+      AGY_BRIDGE_NODE: ${BUN_PATH:-/config/cache/magpie/bun/1.4.4/magpie-bun}
+      AGY_API_KEY_FILE: /run/secrets/agy-api-key
+      AGY_CLI_DISABLE_AUTO_UPDATE: "true"
+      AGY_BRIDGE_MAX_PROCS: ${AGY_BRIDGE_MAX_PROCS:-2}
+      AGY_BRIDGE_IDLE_MS: ${AGY_BRIDGE_IDLE_MS:-120000}
+      AGY_BRIDGE_START_TIMEOUT_MS: ${AGY_BRIDGE_START_TIMEOUT_MS:-30000}
+      AGY_BRIDGE_TURN_TIMEOUT_MS: ${AGY_BRIDGE_TURN_TIMEOUT_MS:-180000}
+      AGY_BRIDGE_STATE_FILE: /state/sessions.json
+    volumes:
+      - ./:/app:ro
+      - ./state:/state
+      - ./api.key:/run/secrets/agy-api-key:ro
+      - ${MAGPIE_CONFIG_DIR:?Set MAGPIE_CONFIG_DIR in .env}:/config
+    healthcheck:
+      test: ["CMD", "${BUN_PATH:-/config/cache/magpie/bun/1.4.4/magpie-bun}", "-e", "const r = await fetch('http://127.0.0.1:9437/healthz'); process.exit(r.ok ? 0 : 1)"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+    logging:
+      driver: json-file
+      options: {max-size: "5m", max-file: "2"}
+networks:
+  cpa:
+    external: true
+    name: ${CPA_NETWORK:-cliproxy-stack_default}

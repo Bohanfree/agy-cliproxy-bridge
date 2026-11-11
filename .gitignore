@@ -1,0 +1,16 @@
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.log
+*.jsonl
+.secrets/
+.artifacts/
+state/
+auth/
+backups/
+deployment/
+node_modules/
+.DS_Store
+__pycache__/

@@ -1,0 +1,15 @@
+# Merge this provider into your EXISTING openai-compatibility list.
+# Native bridge: use an address reachable by CPA, e.g. host.docker.internal:9437.
+# Compose bridge sharing CPA_NETWORK: use http://bridge:9437/v1.
+openai-compatibility:
+  - name: agy-cli
+    base-url: http://bridge:9437/v1
+    api-key-entries:
+      - api-key: REPLACE_WITH_CONTENTS_OF_YOUR_LOCAL_API_KEY_FILE
+    models:
+      - name: gemini-3.8-flash
+        alias: agy-gemini-3.8-flash
+      - name: gemini-4-argon
+        alias: agy-gemini-4-argon
+      - name: gemini-4-carbon
+        alias: agy-gemini-4-carbon

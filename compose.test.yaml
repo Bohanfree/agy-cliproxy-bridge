@@ -1,0 +1,29 @@
+# Deterministic fixture only: no Google account, login, or real model requests.
+name: agy-cliproxy-test
+services:
+  fixture:
+    image: node:22-bookworm-slim
+    working_dir: /app
+    command: ["node", "test/fixture.mjs"]
+    user: "1000:1000"
+    read_only: true
+    mem_limit: 128m
+    volumes: ["./:/app:ro"]
+    environment: {BIND: 0.0.0.0, PORT: "9438"}
+    networks: [test]
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:9438/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+  cpa:
+    image: ${CPA_IMAGE:-eceasy/cli-proxy-api:latest}
+    depends_on:
+      fixture: {condition: service_healthy}
+    mem_limit: 192m
+    ports: ["127.0.0.1:19438:8317"]
+    volumes: ["./examples/cpa-test.yaml:/CLIProxyAPI/config.yaml:ro"]
+    networks: [test]
+networks:
+  test:
+    driver: bridge

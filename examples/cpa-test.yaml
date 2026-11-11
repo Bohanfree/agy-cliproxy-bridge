@@ -1,0 +1,15 @@
+host: 0.0.0.0
+port: 8317
+auth-dir: /tmp/test-auth
+# Public deterministic fixture values. Never use these keys for real services.
+api-keys: [fixture-only-client-key-not-a-secret]
+request-retry: 0
+logging-to-file: false
+openai-compatibility:
+  - name: agy-fixture
+    base-url: http://fixture:9438/v1
+    api-key-entries:
+      - api-key: fixture-only-bridge-key-not-a-secret
+    models:
+      - name: gemini-3.8-flash
+        alias: agy-gemini-3.8-flash
