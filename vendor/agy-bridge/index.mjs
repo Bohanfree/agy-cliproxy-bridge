@@ -5014,8 +5014,9 @@ export const AntigravityBridgePlugin = async () => {
                   proc.validateResults(rawResults)
                   // A prefilled assistant continuation cannot settle a partial
                   // parallel batch: preserve the owner until every result arrives.
-                  if (prefillTailEnabled() && prefillRun(body.messages) &&
-                    pendingCallCount(turn) > new Set(rawResults.map(item => item.call.id)).size) {
+                  const answeredCalls = new Set(rawResults.map(item => item.call))
+                  if (prefillTailEnabled() && prefillRun(body.messages) && turn.calls.some(call =>
+                    ((call.mcpSeen && !call.mcpResponded) || (call.deferred && !call.result)) && !answeredCalls.has(call))) {
                     return jsonError(400, "agy bridge: missing pending tool results before assistant prefill")
                   }
                   let interrupted = isInterruptedToolTurn(body)
