@@ -3,7 +3,8 @@
 ## Vendored AGY ACP bridge
 
 `vendor/agy-bridge/` contains a patched copy of the MIT-licensed
-`@magpie-community/opencode-agy-cli-auth` package, version 0.1.3.
+`@magpie-community/opencode-agy-cli-auth` package, based on 0.1.19
+with selected fixes through 0.1.25.
 
 - Package repository: https://github.com/magpie-community/plugins/tree/main/packages/agy-cli
 - Original bridge: https://github.com/DylanLIiii/opencode-antigravity-bridge
@@ -13,8 +14,9 @@
   Made With MOXY Ltd MIT copyright and license text inline.
 
 The vendored files started from the patched baseline used by this adapter.
-Version 0.1.1 adds a local continuation-boundary patch to `index.mjs`; the
-original baseline hash and the local patch are recorded in `vendor/provenance.json`.
+Local changes preserve continuation boundaries, session reuse, transcript-based
+usage accounting and result receipts; upstream lineage and file hashes are
+recorded in `vendor/provenance.json`.
 The detailed patch lineage is retained in
 `vendor/agy-bridge/NOTICE.md`; SHA-256 checksums are in `vendor/provenance.json`.
 The recorded checksums identify the exact vendored contents, rather than claiming

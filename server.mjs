@@ -17,7 +17,7 @@ export function createBridgeServer({key, bridgeFetch, models, requestTimeoutMs =
     const json = (status, body) => { res.writeHead(status, {'content-type': 'application/json'}); res.end(JSON.stringify(body)); };
     try {
       const pathname = new URL(req.url, 'http://localhost').pathname;
-      if (pathname === '/healthz' && req.method === 'GET') return json(200, {status: 'ok', service: 'agy-cliproxy-bridge', version: '0.1.1'});
+      if (pathname === '/healthz' && req.method === 'GET') return json(200, {status: 'ok', service: 'agy-cliproxy-bridge', version: '0.1.2-agy.0.1.25-local.20261112.1'});
       const actual = Buffer.from(req.headers.authorization || '');
       if (actual.length !== expected.length || !timingSafeEqual(actual, expected))
         return json(401, {error: {type: 'authentication_error', message: 'Invalid API key'}});

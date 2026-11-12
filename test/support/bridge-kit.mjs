@@ -44,7 +44,8 @@ const RUNTIME_NAMES = ["Date", "setTimeout", "clearTimeout", "setInterval", "cle
 const RUNTIME_PRELUDE = `import { ${RUNTIME_NAMES.join(", ")} } from ${JSON.stringify(RUNTIME_SPECIFIER)};\n`
 const TEST_EXPORTS = "\nexport { Turn as __agyTestTurn, allProcs as __agyTestAllProcs, pool as __agyTestPool, " +
   "execOnce as __agyTestExecOnce, findAgy as __agyTestFindAgy, canonicalBody as __agyTestCanonicalBody, " +
-  "conversationKey as __agyTestConversationKey, renderInitialPromptParts as __agyTestRenderInitialPromptParts };\n"
+  "conversationKey as __agyTestConversationKey, renderInitialPromptParts as __agyTestRenderInitialPromptParts, " +
+  "normalizeAcpUsage as __agyTestNormalizeAcpUsage, inspectToolTurn as __agyTestInspectToolTurn };\n"
 const IDENTIFIER_RE = /^[A-Za-z_$][\w$]*$/
 
 if (typeof vm.SourceTextModule !== "function" || typeof vm.SyntheticModule !== "function") {
@@ -457,7 +458,7 @@ export async function createBridgeKit(options = {}) {
     address() { return { address: "127.0.0.1", family: "IPv4", port: 45999 } },
   }
   const overrides = {
-    "node:child_process": { spawn },
+    "node:child_process": { spawn, spawnSync },
     "node:net": {
       createServer(handler) {
         kit.controlHandler = handler
@@ -488,6 +489,10 @@ export async function createBridgeKit(options = {}) {
     if (key === "./usage.mjs") module = sourceModule(USAGE_FILE, "", usageUrl)
     else if (key === "./platform.mjs") module = sourceModule(PLATFORM_FILE, "", platformUrl)
     else if (key === "./login.mjs") module = sourceModule(LOGIN_FILE, "", loginUrl)
+    else if (/^\.\/(?:transcript-usage|array-items|cloak|re2-pattern)\.mjs$/.test(key)) {
+      const file = path.join(REPO_DIR, key.slice(2))
+      module = sourceModule(file, "", pathToFileURL(file).href)
+    }
     else if (key.startsWith("node:")) module = builtinModule(key, overrides[key])
     else throw new Error(`testkit: 未登记的依赖 ${specifier}`)
     cache.set(key, module)

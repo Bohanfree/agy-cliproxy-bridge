@@ -1,5 +1,6 @@
-import { agyCandidates, spawnAgy, windowsMcpShim } from "./platform.mjs"
-import { spawn } from "node:child_process"
+import { TranscriptUsageReader } from "./transcript-usage.mjs"
+import { agyCandidates, spawnAgy, windowsMcpShim, windowsNcBuild, windowsTreeKill } from "./platform.mjs"
+import { spawn, spawnSync } from "node:child_process"
 import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto"
 import { once } from "node:events"
 import fs from "node:fs"
@@ -8,7 +9,10 @@ import os from "node:os"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
 import { createUsageReader } from "./usage.mjs"
+import { sanitizePatternFields } from "./re2-pattern.mjs"
 import { startLogin } from "./login.mjs"
+import { ensureGeminiArrayItems } from "./array-items.mjs"
+import { cloak, hint, turnsAway } from "./cloak.mjs"
 
 const PROVIDER_ID = "agy-cli"
 // Client tools reach the session through a private `nc` placed first on agy's
@@ -44,14 +48,8 @@ const AGENT_NAME = "magpie-bridge"
 const MCP_SERVER_PATH = fileURLToPath(new URL("./mcp-server.mjs", import.meta.url))
 // agy exposes tools from the --ide-mcp-port server as direct functions with this prefix.
 const IDE_TOOL_PREFIX = "mcp_ide-tools_"
-const SCHEMA_TOOL_NAME = "bridge_tool_schema"
-const CALL_TOOL_NAME = "bridge_call_tool"
-function bridgeToolName(name) {
-  const limit = 64 - IDE_TOOL_PREFIX.length
-  if (/^[a-zA-Z0-9_-]+$/.test(name) && name.length <= limit) return name
-  return name.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, limit - 17) +
-    "_" + createHash("sha256").update(name).digest("hex").slice(0, 16)
-}
+// agy 1.3.5+: a tools/list entry with this _meta key is never deferred.
+const ALWAYS_LOAD = "antigravity/alwaysLoad"
 const IDLE_MS = positiveTimeout(process.env.AGY_BRIDGE_IDLE_MS, 10 * 60 * 1000)
 // Read at call time so a host (or a test) can size the pool without a reload.
 function maxProcs() {
@@ -125,6 +123,8 @@ let cachedAgySearchKey
 let controlServer
 let controlServerPromise
 let shimDir
+// Only a shim dir this process made is removed at exit; the shared Windows nc.exe dir stays.
+let shimDirOwned = false
 let shimDirPromise
 
 function positiveTimeout(value, fallback) {
@@ -632,15 +632,6 @@ class BusyError extends Error {
   }
 }
 
-class BridgeToolsUnavailable extends Error {
-  constructor(reason) {
-    super(`agy bridge: client tools are unavailable: ${reason}`)
-    this.statusCode = 503
-    this.code = "bridge_tools_unavailable"
-    this.noRetry = true
-  }
-}
-
 class ConflictError extends Error {
   constructor(message, code) {
     super(message)
@@ -674,9 +665,21 @@ function shellQuote(value) {
 // agy connects to --ide-mcp-port by running `nc host port`. A private `nc`
 // earlier in agy's PATH runs the bridge's stdio MCP server instead, so the
 // connection is authenticated by the per-process token in its environment.
-function ensureShimDir() {
+async function ensureShimDir() {
+  // Another host's sweep can take a shared dir that sat unused for a week.
+  if (shimDir && !shimDirOwned && !await isFileWithBytes(path.join(shimDir, "nc.exe"))) {
+    shimDir = undefined
+    shimDirPromise = null
+  }
   if (shimDirPromise) return shimDirPromise
   shimDirPromise = (async () => {
+    if (process.platform === "win32") {
+      const shared = await windowsNcDir().catch(() => null)
+      if (shared) {
+        shimDir = shared
+        return shared
+      }
+    }
     const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "magpie-agy-bridge-bin-"))
     if (process.platform === "win32") {
       await fs.promises.writeFile(path.join(dir, "nc.cmd"),
@@ -686,10 +689,78 @@ function ensureShimDir() {
         `#!/bin/sh\nexec ${shellQuote(process.execPath)} ${shellQuote(MCP_SERVER_PATH)}\n`, { mode: 0o700 })
     }
     shimDir = dir
+    shimDirOwned = true
     return dir
   })()
   shimDirPromise.catch(() => { shimDirPromise = null })
   return shimDirPromise
+}
+
+// Windows: a dir holding only nc.exe, a GUI-subsystem build of mcp-server.mjs
+// (see windowsNcBuild). It is named for the runtime and the server's source, so
+// every session and every later host reuses it. One no host has started for a
+// week is swept. null when the runtime can't build it.
+const WINDOWS_NC_PREFIX = "magpie-agy-bridge-nc-"
+const WINDOWS_NC_BUILD_PREFIX = "magpie-agy-bridge-ncbuild-"
+const WINDOWS_NC_BUILD_TIMEOUT_MS = 120_000
+
+async function isFileWithBytes(file) {
+  try {
+    const stat = await fs.promises.stat(file)
+    return stat.isFile() && stat.size > 0
+  } catch {
+    return false
+  }
+}
+
+async function windowsNcDir() {
+  if (!windowsNcBuild(process.execPath, MCP_SERVER_PATH, "nc.exe")) return null
+  const tmp = os.tmpdir()
+  const source = await fs.promises.readFile(MCP_SERVER_PATH)
+  const key = createHash("sha256").update(String(process.execPath)).update("\0")
+    .update(String(process.versions?.bun || "")).update("\0").update(source).digest("hex").slice(0, 16)
+  const dir = path.join(tmp, WINDOWS_NC_PREFIX + key)
+  const exe = path.join(dir, "nc.exe")
+  if (await isFileWithBytes(exe)) {
+    const now = new Date()
+    await fs.promises.utimes(exe, now, now).catch(() => {})
+    return dir
+  }
+  const build = await fs.promises.mkdtemp(path.join(tmp, WINDOWS_NC_BUILD_PREFIX))
+  try {
+    const spec = windowsNcBuild(process.execPath, MCP_SERVER_PATH, path.join(build, "nc.exe"))
+    const { err, code, timedOut } = await execOnce(spec.file, spec.args, { cwd: build, timeoutMs: WINDOWS_NC_BUILD_TIMEOUT_MS })
+    if (err || timedOut || code !== 0 || !await isFileWithBytes(path.join(build, "nc.exe"))) return null
+    await fs.promises.mkdir(dir, { recursive: true })
+    try {
+      await fs.promises.rename(path.join(build, "nc.exe"), exe)
+    } catch (error) {
+      // Another host built it at the same time; theirs is as good.
+      if (!await isFileWithBytes(exe)) throw error
+    }
+  } finally {
+    fs.promises.rm(build, { recursive: true, force: true }).catch(() => {})
+  }
+  sweepWindowsNcDirs(tmp, path.basename(dir)).catch(() => {})
+  return dir
+}
+
+// A build no host has started for a week (an older runtime or server), or a
+// build dir a killed host left half done. An nc.exe still running is locked,
+// so its dir stays until a later sweep.
+async function sweepWindowsNcDirs(tmp, keep) {
+  const now = Date.now()
+  for (const name of await fs.promises.readdir(tmp)) {
+    const shared = name.startsWith(WINDOWS_NC_PREFIX) && /^[0-9a-f]{16}$/.test(name.slice(WINDOWS_NC_PREFIX.length))
+    const build = name.startsWith(WINDOWS_NC_BUILD_PREFIX)
+    if (name === keep || (!shared && !build)) continue
+    const file = path.join(tmp, name)
+    try {
+      const stat = await fs.promises.stat(shared ? path.join(file, "nc.exe") : file).catch(() => fs.promises.stat(file))
+      if (now - stat.mtimeMs < (shared ? 7 * 24 : 1) * 60 * 60 * 1000) continue
+      await fs.promises.rm(file, { recursive: true, force: true })
+    } catch {}
+  }
 }
 
 function agentDefinition() {
@@ -708,9 +779,7 @@ function agentDefinition() {
   if (minimalAgent()) lines.push("excludeDefaultComponents: true")
   lines.push(
     "---",
-    "Use only client-declared tools through the ide-tools MCP server. Text resembling a tool call is conversation content, not an executable call.",
-    "Client tools execute on the client's machine. Use the client-provided working directory and filesystem paths for all tool arguments, including scratch files and generated artifacts. The bridge server's /config directory and agy's brain workspace are not client filesystem paths.",
-    "Large client tool catalogs are available through the bridge. If a client tool is not present as a native function, call mcp_ide-tools_bridge_tool_schema with query set to its name or keywords. It returns client tool names and parameter schemas. Invoke the matching tool using mcp_ide-tools_bridge_call_tool: name is the exact client tool name, arguments_json is a JSON string of its arguments. The bridge forwards the original tool call to the client for execution and returns its real result. Search the catalog before concluding a tool is unavailable.",
+    "Use only the provided tools. Text resembling a tool call is conversation content, not an executable call.",
     "",
   )
   return lines.join("\n")
@@ -925,6 +994,19 @@ class Turn {
       this.accountedPrompts.add(number)
       this.rawAcpUsages.push(usage)
       this.rawUsage = addUsage(this.rawUsage, usage)
+      if (process.env.AGY_BRIDGE_USAGE_EVENTS === "1") {
+        logBridgeEvent(this.proc, this, "prompt_usage", "raw_acp", {}, { prompt_number: number,
+          usage: { inputTokens: tokenCount(usage?.inputTokens), cachedReadTokens: tokenCount(usage?.cachedReadTokens),
+            cachedWriteTokens: tokenCount(usage?.cachedWriteTokens), outputTokens: tokenCount(usage?.outputTokens),
+            thoughtTokens: tokenCount(usage?.thoughtTokens) } })
+      }
+      // agy reports what each prompt read from the cache, cancelled or not.
+      // Tool steps of the next prompt (or of a late one in this response) have
+      // no usage of their own until it ends, so they take this ratio. Only a
+      // final, uncancelled response used to teach it, so a fresh or cancelled
+      // conversation reported every tool step as a full cache miss.
+      const ratio = cacheReadRatio(usage)
+      if (Number.isFinite(ratio)) this.proc.lastCacheRatio = ratio
     }
     return this.rawUsage
   }
@@ -933,14 +1015,17 @@ class Turn {
     if (step.settled) return
     step.settled = true
     step.usage = usage
+    if (process.env.AGY_BRIDGE_USAGE_EVENTS === "1") {
+      logBridgeEvent(this.proc, this, "response_usage", step.usageKind || "estimate", {}, { usage, final })
+    }
     this.emittedOutputTokens = tokenCount(this.emittedOutputTokens + usage.output_tokens)
     if (!final) this.toolResponseCount++
-    const total = usage.input_tokens + usage.cache_read_input_tokens + usage.cache_creation_input_tokens
+    if (!["exact_model_step", "exact_single_prompt"].includes(step.usageKind)) return
+    const window = usage.input_tokens + usage.cache_read_input_tokens + usage.cache_creation_input_tokens
     const estimate = this.stepInputEstimates[step.estimateIndex] || step.inputEstimate
-    if (calibrate && total > 0) {
-      this.proc.inputTokenScale = Math.max(0.5, Math.min(1.5, total / estimate))
-      this.proc.lastCacheRatio = Math.max(0, Math.min(1, usage.cache_read_input_tokens / total))
-    }
+    if (estimate > 0 && window > 0) this.proc.inputTokenScale = Math.max(0.5, Math.min(1.5, window / estimate))
+    const readWindow = usage.input_tokens + usage.cache_read_input_tokens
+    if (readWindow > 0) this.proc.lastCacheRatio = usage.cache_read_input_tokens / readWindow
   }
 
   attach() {
@@ -1091,6 +1176,9 @@ class Proc {
     this.toolsSignature = JSON.stringify(opts.tools)
     this.workDir = opts.workDir
     this.instructions = opts.instructions || ""
+    this.userId = opts.userId || ""
+    this.openingText = openingTextOf(opts.messages?.[0])
+    this.openingImages = openingImagesOf(opts.messages?.[0])
     this.resumeFrom = opts.resume || null
     this.token = randomUUID()
     this.sessionId = null
@@ -1100,7 +1188,9 @@ class Proc {
     // Learned from settled single-model-call responses; scales the local input
     // estimate used for tool-step responses that carry no exact usage.
     this.inputTokenScale = 1
-    this.lastCacheRatio = 0
+    // Unset until recordPromptUsage or a final calibrated response teaches
+    // it, including a recorded 0. Distinct from a calibrated miss.
+    this.lastCacheRatio = undefined
     this.configOptions = []
     this.configMethodUnsupported = false
     this.currentSelectionKey = null
@@ -1195,8 +1285,12 @@ class Proc {
     })
     try {
       await Promise.race([this.#handshake(), timeout])
+      if (process.env.AGY_BRIDGE_TRANSCRIPT_USAGE !== "0" && /^[a-zA-Z0-9-]+$/.test(this.sessionId || "")) {
+        const brain = process.env.AGY_BRIDGE_TRANSCRIPT_ROOT || path.join(os.homedir(), ".gemini", "antigravity-cli", "brain")
+        this.transcriptUsage = new TranscriptUsageReader(path.join(brain, this.sessionId, ".system_generated", "logs", "transcript.jsonl"))
+        await this.transcriptUsage.initialize()
+      }
     } catch (error) {
-      if (error instanceof BridgeToolsUnavailable) throw error
       if (this.dead && this.deadError && error !== this.deadError && !/timed out starting/.test(error.message)) {
         throw new Error(`agy failed before the ACP session started: ${this.deadError.message}`)
       }
@@ -1224,7 +1318,7 @@ class Proc {
     const resumable = !!(capabilities.sessionCapabilities?.resume ?? capabilities.session_capabilities?.resume)
     this.instructionsInSession = appendable && !!this.instructions
     const meta = this.instructionsInSession
-      ? { _meta: { antigravity: { systemPrompt: { append: this.instructions } } } }
+      ? { _meta: { antigravity: { systemPrompt: { append: cloak(this.instructions) } } } }
       : {}
 
     let session = null
@@ -1307,63 +1401,29 @@ class Proc {
   }
 
   #waitForToolList(version) {
-    if (this.dead) return Promise.reject(new BridgeToolsUnavailable("agy exited before the tool catalog was ready"))
-    if (this.listedVersion >= version) return Promise.resolve()
-    return new Promise((resolve, reject) => {
-      const waiter = { version, resolve, reject, timer: null }
+    if (this.listedVersion >= version || this.dead) return Promise.resolve()
+    return new Promise((resolve) => {
+      const waiter = { version, resolve, timer: null }
       waiter.timer = setTimeout(() => {
         this.listWaiters = this.listWaiters.filter((item) => item !== waiter)
-        reject(new BridgeToolsUnavailable(`MCP did not request catalog version ${version} within ${TOOL_LIST_WAIT_MS}ms`))
+        resolve()
       }, TOOL_LIST_WAIT_MS)
       this.listWaiters.push(waiter)
     })
   }
 
   listTools() {
-    const firstListing = this.listedVersion < this.toolsVersion
     this.listedVersion = Math.max(this.listedVersion, this.toolsVersion)
-    if (firstListing) {
-      console.error("[agy-bridge-tools] " + JSON.stringify({
-        event: "catalog_served", version: this.listedVersion, count: this.tools.length,
-      }))
-    }
     for (const waiter of this.listWaiters.filter((item) => item.version <= this.listedVersion)) {
       clearTimeout(waiter.timer)
       waiter.resolve()
     }
     this.listWaiters = this.listWaiters.filter((item) => item.version > this.listedVersion)
-    // Keep file/command tools resident. Integrations remain in the client
-    // catalog and use a permanent schema lookup + invocation pair, avoiding
-    // agy's unreliable mid-generation registration of newly listed functions.
-    const core = this.tools.filter(tool => !tool.name.startsWith("mcp__")).slice(0, 48)
-    const names = new Set(core.map(tool => tool.name))
-    const visible = this.tools.length <= 64 ? this.tools : this.tools.filter(tool => names.has(tool.name))
-    const declarations = visible.map(tool => {
-      const name = bridgeToolName(tool.name)
-      return {
-        ...tool, name,
-        _meta: { ...tool._meta, "antigravity/alwaysLoad": true },
-        ...(name === tool.name ? {} : {
-          description: `${tool.description || ""}\nClient tool name: ${tool.name}`.trim(),
-        }),
-      }
-    })
-    if (this.tools.length) declarations.unshift({
-      name: SCHEMA_TOOL_NAME,
-      description: "Find client tools by name or keywords. Returns exact client names and parameter schemas for bridge_call_tool.",
-      inputSchema: { type: "object", properties: { query: { type: "string" } }, required: ["query"] },
-      _meta: { "antigravity/alwaysLoad": true },
-    }, {
-      name: CALL_TOOL_NAME,
-      description: "Invoke a declared client tool using its exact name and a JSON string of arguments. Use bridge_tool_schema to find its schema. Execution and approval take place in the client.",
-      inputSchema: {
-        type: "object",
-        properties: { name: { type: "string" }, arguments_json: { type: "string" } },
-        required: ["name", "arguments_json"],
-      },
-      _meta: { "antigravity/alwaysLoad": true },
-    })
-    return declarations
+    // agy loads an MCP tool on demand, out of the model's function list, unless
+    // the server marks it always loaded; tools with larger schemas were left out
+    // and the model could not reach them (#989). Every client-declared tool is
+    // one the client means the model to see.
+    return this.tools.map((tool) => ({ ...tool, _meta: { ...tool._meta, [ALWAYS_LOAD]: true } }))
   }
 
   addWatcher(socket) {
@@ -1371,34 +1431,26 @@ class Proc {
     socket.once("close", () => this.watchers.delete(socket))
   }
 
+  // Whether the client now declares a tool agy has not listed. agy checks a
+  // call against the tools it listed before the prompt began, so a tool added
+  // mid-turn (ToolSearch) stays unknown until the next session/prompt (#942).
+  toolsGrew(tools) {
+    const known = new Set(this.tools.map((tool) => tool.name))
+    return tools.some((tool) => !known.has(tool.name))
+  }
+
   // Swap the client tool catalog in place; agy re-lists on tools/list_changed.
   async updateTools(tools) {
     const signature = JSON.stringify(tools)
-    if (signature === this.toolsSignature) {
-      if (tools.length) await this.#waitForToolList(this.toolsVersion)
-      return
-    }
+    if (signature === this.toolsSignature) return
     this.tools = tools
-    try {
-      await this.#announceTools()
-      this.toolsSignature = signature
-    } catch (error) {
-      // Never reuse or resume a session with a stale client tool catalog.
-      // Existing pending calls are closed by stop(), never executed again here.
-      this.historyInvalid = true
-      this.retiring = true
-      dropFromPool(this)
-      unpark(this.convKey)
-      await this.stop().catch(() => {})
-      throw error
-    }
+    this.toolsSignature = signature
+    await this.#announceTools()
   }
 
   async #announceTools() {
     const version = ++this.toolsVersion
-    if (!this.watchers.size) {
-      throw new BridgeToolsUnavailable("MCP disconnected before the tool catalog could be updated")
-    }
+    if (!this.watchers.size) return
     for (const socket of this.watchers) {
       try { socket.write(JSON.stringify({ event: "tools_changed" }) + "\n") } catch {}
     }
@@ -1463,7 +1515,17 @@ class Proc {
   matchesHistory(messages) {
     if (this.historyInvalid) return false
     if (this.expectedMessages == null) return !this.turn && !this.hasSentFirstTurn
-    return historyKey(this.expectedMessages) === historyKey(messages)
+    if (historyKey(this.expectedMessages) === historyKey(messages)) return true
+    // Clients such as Claude Code canonicalize tool_use.input when they
+    // persist history (e.g. filling default replace_all: false). The live
+    // session still has the model-issued arguments. historyKey already
+    // ordinalizes tool ids, so this loose path (reached only after an exact
+    // historyKey miss) requires the raw tool_use id+name sequence to line
+    // up before ignoring input values. An exact match can still succeed if
+    // only ids changed and inputs did not.
+    return sameToolUseIdentities(this.expectedMessages, messages) &&
+      historyKey(stripToolUseInputs(this.expectedMessages)) ===
+        historyKey(stripToolUseInputs(messages))
   }
 
   // Clients such as Claude Code normalize tool_use inputs when recording an
@@ -1488,15 +1550,28 @@ class Proc {
       !call.id || call.id !== expectedCalls[index].id || call.name !== expectedCalls[index].name)) {
       return false
     }
-    const stripToolInputs = (messages) => messages.map((message) => ({
-      ...message,
-      content: Array.isArray(message.content)
-        ? message.content.map((block) => block?.type === "tool_use"
-          ? { type: "tool_use", id: block.id, name: block.name, input: {} }
-          : block)
-        : message.content,
-    }))
-    return historyKey(stripToolInputs(expectedAssistant)) === historyKey(stripToolInputs(actualAssistant))
+    return historyKey(stripToolUseInputs(expectedAssistant)) === historyKey(stripToolUseInputs(actualAssistant))
+  }
+
+  // Answers the pending calls with the results the client sent, cancels what
+  // agy was doing next, and leaves the session at `history`, ready for the
+  // steer's prompt. False when anything is off; the caller then replays in a
+  // new session, as before.
+  async steerInSession(turn, results, history) {
+    if (this.dead || this.stopping || this.retiring || this.turn !== turn || turn.done || turn.finalized ||
+      !Array.isArray(history)) return false
+    // An image in a result is replayed in the prompt, as before.
+    if (results.some((item) => item.result.content.some((part) => part.type !== "text"))) return false
+    try {
+      this.continueWith(results)
+    } catch {
+      return false
+    }
+    if (!this.cancelTurn(turn, [])) return false
+    await Promise.race([turn.settled, new Promise((resolve) => setTimeout(resolve, CANCEL_SETTLE_MS))])
+    if (!turn.finalized || this.dead || this.stopping || this.historyInvalid || this.turn) return false
+    this.expectedMessages = history.map((message) => ({ ...message }))
+    return true
   }
 
   recordToolResults(turn, messages) {
@@ -1511,6 +1586,10 @@ class Proc {
 
   async #runTurn(turn, content, model, selection) {
     try {
+      // Cancelled/aborted generations may have finished accounting after the
+      // client detached. Preserve their ledger without charging the next turn.
+      const unreturned = await this.transcriptUsage?.read()
+      if (unreturned) logBridgeEvent(this, turn, "unreturned_model_usage", "previous_turn_finished_after_detach", {}, { usage: unreturned.usage, model_steps: unreturned.steps })
       turn.arm()
       if (model) await this.#setModel(model, selection)
       // Content a cancelled turn never delivered still belongs to the session.
@@ -1588,6 +1667,15 @@ class Proc {
   }
 
   #formatAgentError(detail) {
+    // The system prompt turned away, not a quota (cloak.mjs): a 400 the next
+    // member of a group is asked after, and the client doesn't retry. It says
+    // what Antigravity answered (a 429).
+    if (/code 429\b/i.test(detail) && /resource has been exhausted/i.test(detail) && turnsAway(this.instructions)) {
+      return new AgentTurnError(
+        `agy bridge: Antigravity answered 429 to this system prompt: ${detail} — ${hint(this.instructions)}`,
+        "invalid_request_error",
+      )
+    }
     if (/QUOTA_EXHAUSTED|RESOURCE_EXHAUSTED|MODEL_CAPACITY_EXHAUSTED|code 429\b/i.test(detail)) {
       return new AgentTurnError(
         `agy bridge: Antigravity quota or rate limit reached${detail ? ": " + detail : ""}`,
@@ -1626,41 +1714,15 @@ class Proc {
     this.stop().catch(() => {})
   }
 
-  async acceptMcpCall(message, socket) {
+  acceptMcpCall(message, socket) {
     const turn = this.turn
     if (!turn || turn.done || turn.finalized || turn.cancelRequested) {
       throw new Error("agy bridge: no active turn for MCP call")
     }
-    if (message.name === SCHEMA_TOOL_NAME) {
-      const query = message.arguments?.query
-      if (typeof query !== "string" || !query.trim()) throw new Error("agy bridge: a schema query is required")
-      const words = query.toLowerCase().split(/\s+/).filter(Boolean)
-      const exact = this.tools.filter(tool => tool.name === query || bridgeToolName(tool.name) === query)
-      const matches = exact.length ? exact : this.tools.filter(tool =>
-        words.every(word => `${tool.name} ${tool.description || ""}`.toLowerCase().includes(word)))
-      const tools = matches.slice(0, 5).map(tool => ({
-        serverName: "ide-tools", toolName: bridgeToolName(tool.name), clientName: tool.name,
-        nativeFunction: IDE_TOOL_PREFIX + CALL_TOOL_NAME,
-        invocationArguments: { name: tool.name, arguments_json: "JSON string of arguments matching inputSchema" },
-        description: tool.description, inputSchema: tool.inputSchema,
-      }))
-      socket.end(JSON.stringify({ result: {
-        content: [{ type: "text", text: JSON.stringify({
-          tools, matches: matches.length,
-          invoke: { nativeFunction: IDE_TOOL_PREFIX + CALL_TOOL_NAME, name: "exact clientName", arguments_json: "JSON string of arguments matching inputSchema" },
-        }) }],
-      } }) + "\n")
-      return
-    }
-    const wrapped = message.name === CALL_TOOL_NAME
-    const tool = wrapped
-      ? this.tools.find(tool => tool.name === message.arguments?.name)
-      : this.tools.find(tool => bridgeToolName(tool.name) === message.name)
-    if (!tool) throw new Error(`agy bridge: undeclared tool ${message.name}`)
-    const name = tool.name
-    if (wrapped && typeof message.arguments?.arguments_json !== "string") throw new Error("agy bridge: arguments_json must be a JSON string")
-    const args = wrapped ? JSON.parse(message.arguments.arguments_json) : (message.arguments ?? {})
+    const name = message.name
+    const args = message.arguments ?? {}
     if (!args || typeof args !== "object" || Array.isArray(args)) throw new Error("agy bridge: invalid tool arguments")
+    if (!this.tools.some((tool) => tool.name === name)) throw new Error(`agy bridge: undeclared tool ${name}`)
     const signature = stableJSON(args)
     const running = turn.calls.find((call) => call.deferred && !call.lateDelivered &&
       call.name === name && stableJSON(call.arguments) === signature)
@@ -1668,8 +1730,6 @@ class Proc {
     const call = {
       id: "toolu_" + randomUUID().replace(/-/g, "").slice(0, 24),
       name,
-      bridgeName: message.name,
-      bridgeArguments: wrapped ? message.arguments : null,
       arguments: args,
       mcpSeen: true,
       mcpResponded: false,
@@ -1852,7 +1912,7 @@ class Proc {
     this.conn?.close(error)
     for (const waiter of this.listWaiters.splice(0)) {
       clearTimeout(waiter.timer)
-      waiter.reject(new BridgeToolsUnavailable("agy exited before the tool catalog was ready"))
+      waiter.resolve()
     }
     if (this.turn && !this.turn.done && !this.stopping) this.turn.fail(error)
   }
@@ -1917,9 +1977,8 @@ class Proc {
 }
 
 function stillRunningText(call) {
-  return `${call.name} is still running in the client; no result yet. To keep waiting, call ${call.bridgeName || call.name} ` +
-    "again with exactly the same arguments" + (call.bridgeArguments ? `: ${JSON.stringify(call.bridgeArguments)}` : "") +
-    ". That waits for this run and does not start it twice."
+  return `${call.name} is still running in the client; no result yet. To keep waiting, call ${call.name} ` +
+    "again with exactly the same arguments. That waits for this run and does not start it twice."
 }
 
 function resultText(result) {
@@ -2139,7 +2198,9 @@ function park(proc) {
     key: proc.convKey,
     sessionId: proc.sessionId,
     historyHash: digest(historyKey(proc.expectedMessages)),
-    instructionsHash: digest(compactIdentity(proc.instructions)),
+    historyHashSansInputs: digest(historyKey(stripToolUseInputs(proc.expectedMessages))),
+    toolUseIdentitiesHash: digest(toolUseIdentitiesKey(proc.expectedMessages) ?? ""),
+    instructionsHash: digest(instructionsIdentity(proc.instructions)),
     workDir: proc.workDir,
     at: Date.now(),
   })
@@ -2155,8 +2216,16 @@ function takeParked(convKey, opts) {
   unparked.add(convKey)
   saveParked()
   if (Date.now() - entry.at > RESUME_TTL_MS || (entry.workDir ?? null) !== (opts.workDir ?? null) ||
-    entry.instructionsHash !== digest(compactIdentity(opts.instructions)) ||
-    entry.historyHash !== digest(historyKey(opts.history))) return null
+    entry.instructionsHash !== digest(instructionsIdentity(opts.instructions))) return null
+  const incoming = digest(historyKey(opts.history))
+  if (entry.historyHash === incoming) return { sessionId: entry.sessionId, expectedMessages: opts.history }
+  // Sans-inputs resume needs the hashes written by current park(). Old
+  // entries without them still resume on an exact historyHash match only.
+  const incomingSans = digest(historyKey(stripToolUseInputs(opts.history)))
+  const incomingIds = toolUseIdentitiesKey(opts.history)
+  const idsOk = incomingIds != null && entry.toolUseIdentitiesHash === digest(incomingIds)
+  const sansOk = entry.historyHashSansInputs === incomingSans || entry.historyHash === incomingSans
+  if (!idsOk || !sansOk) return null
   return { sessionId: entry.sessionId, expectedMessages: opts.history }
 }
 
@@ -2237,12 +2306,41 @@ async function withAcquireLock(key, fn) {
   }
 }
 
+async function withAcquireLocks(keys, fn) {
+  const unique = [...new Set(keys.filter(Boolean))].sort()
+  const run = (index) => {
+    if (index >= unique.length) return fn()
+    return withAcquireLock(unique[index], () => run(index + 1))
+  }
+  return run(0)
+}
+
 async function acquireProc(agyPath, convKey, opts, isFreshConversation, forceNew = false) {
-  return withAcquireLock(convKey, () => acquireProcLocked(agyPath, convKey, opts, isFreshConversation, forceNew))
+  // Discover a live continued session's current key, lock it together with
+  // the new key (sorted, to avoid deadlock), then pick again inside those
+  // locks. A process is re-keyed only when its current key is already held.
+  let extra = null
+  for (let attempt = 0; ; attempt++) {
+    const keys = extra && extra !== convKey ? [convKey, extra] : [convKey]
+    const outcome = await withAcquireLocks(keys, async () => {
+      const locked = new Set(keys)
+      if (isFreshConversation && !forceNew && !pool.get(convKey)) {
+        const candidate = findLiveContinuedProc(opts)
+        const needed = candidate?.convKey
+        if (needed && !locked.has(needed) && attempt < 2) return { retry: needed }
+      }
+      return { value: await acquireProcLocked(agyPath, convKey, opts, isFreshConversation, forceNew, locked) }
+    })
+    if (outcome.retry) {
+      extra = outcome.retry
+      continue
+    }
+    return outcome.value
+  }
 }
 
 // Caller holds the conversation lock; recovery must not acquire it recursively.
-async function acquireProcLocked(agyPath, convKey, opts, isFreshConversation, forceNew = false) {
+async function acquireProcLocked(agyPath, convKey, opts, isFreshConversation, forceNew = false, lockedKeys = new Set([convKey])) {
   await evictIdle()
   let existing = pool.get(convKey)
   if (existing?.turn?.cancelRequested) {
@@ -2267,6 +2365,13 @@ async function acquireProcLocked(agyPath, convKey, opts, isFreshConversation, fo
       throw new ConflictError("agy bridge: this request carries the pending tool call but no matching result. Stop resending it; send the tool result or continue from the last self-consistent message.", "tool_state_conflict")
     }
   }
+  // A flattened, growing first message changes conversationKey, so the live
+  // session is under the previous key. Reuse it when the new opening continues
+  // the whole previous opening (not just a shared prefix).
+  if (!existing && !forceNew && isFreshConversation) {
+    const candidate = findLiveContinuedProc(opts)
+    if (candidate && lockedKeys.has(candidate.convKey)) existing = rekeyProc(candidate, convKey)
+  }
   if (existing) {
     if (!existing.dead && existing.turn) {
       throw new BusyError("agy bridge: this conversation still has an unfinished response")
@@ -2280,13 +2385,27 @@ async function acquireProcLocked(agyPath, convKey, opts, isFreshConversation, fo
         matchedHistory = opts.messages.slice(0, k)
       }
     }
+    const continuedFresh = isFreshConversation && existing.hasSentFirstTurn &&
+      isContinuedOpening(existing, Array.isArray(opts.messages) ? opts.messages[0] : null)
     const compatible = !forceNew && !existing.dead && !existing.retiring &&
       existing.workDir === opts.workDir && sameInstructions(existing.instructions, opts.instructions) &&
-      existing.matchesHistory(matchedHistory)
-    if (compatible && !(isFreshConversation && existing.hasSentFirstTurn)) {
+      (existing.matchesHistory(matchedHistory) || continuedFresh)
+    if (compatible && (!(isFreshConversation && existing.hasSentFirstTurn) || continuedFresh)) {
+      if (continuedFresh) {
+        const first = Array.isArray(opts.messages) ? opts.messages[0] : null
+        // Snapshot the unsent tail before openingText advances to this turn.
+        existing.pendingFlattenedTurn = flattenedContinuationMessage(existing, first)
+        existing.openingText = openingTextOf(first) || existing.openingText
+        existing.openingImages = openingImagesOf(first)
+      }
       await existing.updateTools(opts.tools)
+      logBridgeEvent(existing, null, "session_reused", continuedFresh ? "flattened_history" : "compatible_history", opts)
       return { proc: existing, history: matchedHistory }
     }
+    logBridgeEvent(existing, null, "session_replaced", forceNew ? "forced_replay" :
+      existing.workDir !== opts.workDir ? "work_directory_changed" :
+      !sameInstructions(existing.instructions, opts.instructions) ? "instructions_changed" :
+      existing.dead ? "process_dead" : existing.retiring ? "process_retiring" : "history_mismatch", opts)
     existing.retiring = true
     dropFromPool(existing)
     await existing.stop().catch(() => {})
@@ -2305,13 +2424,14 @@ async function acquireProcLocked(agyPath, convKey, opts, isFreshConversation, fo
     throw error
   }
   pool.set(convKey, proc)
+  logBridgeEvent(proc, null, resume ? "session_resumed" : "session_created", resume ? "persisted_session" : forceNew ? "forced_replay" : "no_compatible_session", opts)
   return { proc, history: opts.history }
 }
 
 // Bounded, content-free events: never log prompts, arguments, results or tool IDs.
 const HOST_EPOCH = randomBytes(4).toString("hex")
 const EVENT_WINDOW_MS = 60_000
-const EVENT_MAX_PER_WINDOW = 30
+const EVENT_MAX_PER_WINDOW = positiveTimeout(process.env.AGY_BRIDGE_EVENT_LIMIT, 120)
 let eventWindowStart = 0
 let eventWindowCount = 0
 // Rows dropped by the rate limit; reported on the next row that gets through.
@@ -2345,6 +2465,7 @@ function logBridgeEvent(proc, turn, action, reason, meta = {}, extra = {}) {
     event: "agy_bridge_tool_state", host_epoch: HOST_EPOCH, ts: now,
     req_id: meta?.reqId ?? null,
     conv: convKey ? digest(convKey).slice(0, 12) : null, turn_id: turn?.turnId ?? null,
+    session_id: proc?.sessionId ?? null,
     action, reason, attached: !!turn?.attached, done: !!turn?.done, dead: !!(proc?.dead || proc?.stopping),
     pending: turn ? pendingCallCount(turn) : 0,
     idle_ms: turn ? Math.max(0, now - turn.lastProgressAt) : null,
@@ -2591,8 +2712,364 @@ function stripMagpiePlaceholderNotice(text) {
   return text.replace(MAGPIE_PLACEHOLDER_NOTICE_RE, "")
 }
 
+// Clear tool_use.input values so a later history comparison can ignore
+// client-canonicalized arguments after raw tool_use ids and names match.
+function stripToolUseInputs(messages) {
+  if (!Array.isArray(messages)) return messages
+  return messages.map((message) => ({
+    ...message,
+    content: Array.isArray(message.content)
+      ? message.content.map((block) => block?.type === "tool_use"
+        ? { type: "tool_use", id: block.id, name: block.name, input: {} }
+        : block)
+      : message.content,
+  }))
+}
+
+function toolUseIdentitiesKey(messages) {
+  if (!Array.isArray(messages)) return null
+  const rows = []
+  for (const message of messages) {
+    const blocks = Array.isArray(message.content) ? message.content : []
+    for (const block of blocks) {
+      if (block?.type !== "tool_use") continue
+      if (!block.id) return null
+      rows.push({ id: block.id, name: block.name || "" })
+    }
+  }
+  return stableJSON(rows)
+}
+
+function sameToolUseIdentities(left, right) {
+  const a = toolUseIdentitiesKey(left)
+  const b = toolUseIdentitiesKey(right)
+  return a != null && a === b
+}
+
 // Compare conversation content, not transport metadata or client-assigned IDs.
 // Keep argument values, result contents and internal whitespace significant.
+
+// Agent-injected Claude Code billing headers. Only whole header lines (and
+// a line that is just the rotating cch token) are removed, so user text that
+// happens to mention "cch=…" or the header name is left alone.
+function stripBillingHeader(text) {
+  let s = String(text ?? "")
+  s = s.replace(/^[ \t]*x-anthropic-billing-header:[^\n]*\n?/gmi, "")
+  s = s.replace(/^[ \t]*cch=[0-9a-fA-F]+;?[ \t]*\n?/gmi, "")
+  return s
+}
+
+const ISO_DATE = String.raw`20\d{2}-\d{2}-\d{2}(?:[ T]\d{2}:\d{2}(?::\d{2})?(?:[.,]\d+)?(?:Z|[+-]\d{2}:?\d{2})?)?`
+const LOCALE_DATE = String.raw`(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)[a-z]*,?\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2},?\s+\d{4}(?:\s+\d{2}:\d{2}(?::\d{2})?)?`
+const CLOCK_VALUE = String.raw`(?:${ISO_DATE}|${LOCALE_DATE}|\d{1,2}:\d{2}(?::\d{2})?(?:\s*[AaPp][Mm])?)`
+const AGENT_CLOCK_LINE_RE = new RegExp(
+  String.raw`^(?:#{1,6}\s*)?(?:(?:(?:current\s+)?(?:date|time|datetime|today|now)|today(?:'s)?\s+date|(?:the\s+)?current\s+(?:date|time|datetime))\s*[:：]\s*${CLOCK_VALUE}|(?:(?:the\s+)?current\s+(?:date|time|datetime)|today(?:'s)?\s+date)\s+is\s+${CLOCK_VALUE})\s*\.?$`,
+  "i",
+)
+
+function isAgentClockLine(line) {
+  return AGENT_CLOCK_LINE_RE.test(String(line ?? "").trim())
+}
+
+function stripAgentClockLines(text) {
+  const s = String(text ?? "")
+  if (!s) return s
+  return s.split(/(\n)/).map((part) => (part === "\n" || !isAgentClockLine(part) ? part : "")).join("")
+}
+
+// System prompt and session instructions: billing headers plus known agent
+// clock lines. User text is never passed through this helper.
+function stripVolatileSystem(text) {
+  return stripAgentClockLines(stripBillingHeader(text))
+}
+
+function instructionsIdentity(text) {
+  return compactIdentity(stripVolatileSystem(text))
+}
+
+// Message text used for conversation/history identity: billing header lines,
+// and clock lines only inside <system-reminder> blocks (Claude Code injects
+// these on later turns too, so a mid-chat clock change must not rewrite the
+// history). Ordinary user/assistant text is left alone, including lines that
+// start with "Today:" or contain a date.
+// Walk closed <system-reminder>…</system-reminder> blocks with indexOf so an
+// unclosed opener does not rescan the rest of the string from every match
+// (the previous /[\s\S]*?/ regex was quadratic in the number of open tags).
+// Length-preserving ASCII fold. s.toLowerCase() maps İ (U+0130) to two
+// code units ("i" + combining dot), which would shift later indexes.
+function asciiLower(s) {
+  return String(s ?? "").replace(/[A-Z]/g, (ch) => String.fromCharCode(ch.charCodeAt(0) + 32))
+}
+
+function replaceClosedSystemReminders(text, replacer) {
+  const s = String(text ?? "")
+  if (!s) return s
+  const open = "<system-reminder"
+  const close = "</system-reminder>"
+  const lower = asciiLower(s)
+  let out = ""
+  let i = 0
+  while (i < s.length) {
+    const start = lower.indexOf(open, i)
+    if (start === -1) {
+      out += s.slice(i)
+      break
+    }
+    const afterName = start + open.length
+    if (afterName < s.length && /[A-Za-z0-9_]/.test(s[afterName])) {
+      out += s.slice(i, afterName)
+      i = afterName
+      continue
+    }
+    const gt = s.indexOf(">", afterName)
+    if (gt === -1) {
+      out += s.slice(i)
+      break
+    }
+    const closeAt = lower.indexOf(close, gt + 1)
+    if (closeAt === -1) {
+      // No closer after this tag means none exists later either; keep the rest
+      // verbatim so later openers do not rescan the same suffix.
+      out += s.slice(i)
+      break
+    }
+    const end = closeAt + close.length
+    out += s.slice(i, start) + replacer(s.slice(start, end))
+    i = end
+  }
+  return out
+}
+
+function stripVolatileOpening(text) {
+  return replaceClosedSystemReminders(stripBillingHeader(text), (block) => stripAgentClockLines(block))
+}
+
+function openingTextOf(message) {
+  if (!message) return ""
+  return compactIdentity(stripVolatileOpening(contentText(message.content)))
+}
+
+function openingImagesOf(message) {
+  const content = message?.content
+  if (!Array.isArray(content)) return []
+  const out = []
+  for (const block of content) {
+    if (block?.type !== "image") continue
+    try {
+      const image = parseUserImage(block)
+      if (image) out.push(`${image.mimeType}:${digest(image.data)}`)
+    } catch {
+      const source = block.source || {}
+      out.push(`invalid:${source.media_type || ""}:${digest(String(source.data || ""))}`)
+    }
+  }
+  return out
+}
+
+function sameOpeningImagePrefix(prev, cur) {
+  if (!Array.isArray(prev) || !Array.isArray(cur) || prev.length > cur.length) return false
+  return prev.every((id, index) => id === cur[index])
+}
+
+// Non-text, non-image blocks on an opening (documents, search results, etc.).
+function openingExtrasOf(message) {
+  const content = message?.content
+  if (!Array.isArray(content)) return []
+  const out = []
+  for (const block of content) {
+    if (!block || typeof block === "string" || block.type === "text" || block.type === "image") continue
+    out.push(digest(stableJSON(block)))
+  }
+  return out
+}
+
+function sameOpeningExtraPrefix(prev, cur) {
+  return sameOpeningImagePrefix(prev, cur)
+}
+
+// Advance through `text` while ignoring whitespace until `compactPrefix` is
+// consumed. Returns the index of the first non-space after the prefix, and
+// whether a newline (a turn boundary) sits between the prefix and the rest.
+function consumeCompactPrefix(text, compactPrefix) {
+  let i = 0
+  let k = 0
+  let lastWasNewline = true
+  while (i < text.length && k < compactPrefix.length) {
+    const ch = text[i]
+    if (/\s/.test(ch)) {
+      if (ch === "\n" || ch === "\r") lastWasNewline = true
+      i++
+      continue
+    }
+    if (ch !== compactPrefix[k]) return null
+    k++
+    i++
+    lastWasNewline = false
+  }
+  if (k < compactPrefix.length) return null
+  let sawNewline = lastWasNewline
+  let j = i
+  while (j < text.length && (text[j] === " " || text[j] === "\t")) j++
+  if (j < text.length && (text[j] === "\n" || text[j] === "\r")) {
+    sawNewline = true
+    while (j < text.length && /\s/.test(text[j])) j++
+  }
+  return { remainderIndex: j, boundary: sawNewline }
+}
+
+function subsequentTranscriptOf(proc) {
+  const messages = proc?.expectedMessages
+  if (!Array.isArray(messages) || messages.length < 2) return ""
+  const parts = []
+  for (const message of messages.slice(1)) {
+    if (!message) continue
+    if (message.role === "assistant") {
+      const text = assistantTextOf(message)
+      if (typeof text === "string" && text.trim()) {
+        parts.push(text)
+        continue
+      }
+      const blocks = Array.isArray(message.content) ? message.content : []
+      for (const block of blocks) {
+        if (!block) continue
+        if (block.type === "text" && typeof block.text === "string" && block.text.trim()) parts.push(block.text)
+        else if (block.type === "tool_use") parts.push(`${block.name || ""}:${stableJSON(block.input ?? {})}`)
+      }
+      continue
+    }
+    const text = contentText(message.content)
+    if (text.trim()) parts.push(text)
+  }
+  return compactIdentity(parts.join("\n"))
+}
+
+const FLAT_ROLE_LABEL_RE = /^(?:assistant|user|system|human|model)\s*:\s*/i
+
+// Leftover text after an optional role label and the subsequent transcript,
+// or null if the remainder does not start with that transcript. The reply
+// must end on a line boundary (or the end of the string) so a longer
+// independent line that only starts with the reply is rejected, including
+// replies of 12 characters or more — length is not a substitute for a
+// turn boundary.
+function leftoverAfterSubsequent(remainder, subsequentCompact) {
+  if (!subsequentCompact) return null
+  let text = remainder
+  if (FLAT_ROLE_LABEL_RE.test(text)) text = text.replace(FLAT_ROLE_LABEL_RE, "")
+  if (!compactIdentity(text).startsWith(subsequentCompact)) return null
+  const consumed = consumeCompactPrefix(text, subsequentCompact)
+  if (!consumed) return null
+  if (!consumed.boundary && consumed.remainderIndex < text.length) return null
+  return text.slice(consumed.remainderIndex)
+}
+
+function remainderHasSubsequent(remainder, subsequentCompact) {
+  return leftoverAfterSubsequent(remainder, subsequentCompact) != null
+}
+
+// The unsent tail of a flattened, growing first message: everything after
+// the previous opening and the live session's subsequent transcript (usually
+// the last assistant reply). Images and extra blocks already sent with the
+// previous opening are dropped; any new images, documents or search results
+// are kept. If the previous extras are not a prefix of the new ones, reuse
+// is refused rather than dropping content.
+function flattenedContinuationMessage(proc, firstMessage) {
+  const prev = proc?.openingText || ""
+  const cur = openingTextOf(firstMessage)
+  if (!prev || !cur || cur === prev) return null
+  // The new opening must continue the whole previous opening, not just a
+  // shared prefix. A shared 8 KiB head with a different tail is a different chat.
+  if (!(cur.startsWith(prev) && cur.length > prev.length + 4)) return null
+  const prevOpening = Array.isArray(proc.expectedMessages) ? proc.expectedMessages[0] : null
+  const prevImages = proc.openingImages || openingImagesOf(prevOpening)
+  const curImages = openingImagesOf(firstMessage)
+  if (!sameOpeningImagePrefix(prevImages, curImages)) return null
+  const prevExtras = openingExtrasOf(prevOpening)
+  const curExtras = openingExtrasOf(firstMessage)
+  if (!sameOpeningExtraPrefix(prevExtras, curExtras)) return null
+  // "Review README" must not attach "Review README and tests". Flattened
+  // history appends later turns after a newline, and those turns are still
+  // sitting on the live process, so require both a turn boundary and the
+  // subsequent transcript (the assistant reply, not just a longer prompt).
+  const curRaw = stripVolatileOpening(contentText(firstMessage?.content))
+  const consumed = consumeCompactPrefix(curRaw, prev)
+  if (!consumed?.boundary) return null
+  const subsequent = subsequentTranscriptOf(proc)
+  if (!subsequent) return null
+  const leftover = leftoverAfterSubsequent(curRaw.slice(consumed.remainderIndex), subsequent)
+  if (leftover == null) return null
+  const newText = leftover.replace(/^\s+/, "")
+  const keptBlocks = []
+  if (Array.isArray(firstMessage?.content)) {
+    let skippedImages = 0
+    let skippedExtras = 0
+    const skipImg = prevImages?.length || 0
+    const skipEx = prevExtras?.length || 0
+    for (const block of firstMessage.content) {
+      if (!block || typeof block === "string" || block.type === "text") continue
+      if (block.type === "image") {
+        if (skippedImages < skipImg) {
+          skippedImages++
+          continue
+        }
+        keptBlocks.push(block)
+        continue
+      }
+      if (skippedExtras < skipEx) {
+        skippedExtras++
+        continue
+      }
+      keptBlocks.push(block)
+    }
+  }
+  if (!newText && !keptBlocks.length) return null
+  if (!keptBlocks.length) return { role: "user", content: newText }
+  const content = []
+  if (newText) content.push({ type: "text", text: newText })
+  content.push(...keptBlocks)
+  return { role: "user", content }
+}
+
+function isContinuedOpening(proc, firstMessage) {
+  return flattenedContinuationMessage(proc, firstMessage) != null
+}
+
+function findLiveContinuedProc(opts) {
+  const first = Array.isArray(opts?.messages) ? opts.messages[0] : null
+  if (!first) return null
+  const userId = opts.userId || ""
+  let best = null
+  let bestLen = -1
+  let tied = false
+  for (const proc of pool.values()) {
+    if (proc.dead || proc.retiring || proc.turn) continue
+    if ((proc.userId || "") !== userId) continue
+    if (proc.workDir !== opts.workDir) continue
+    if (!sameInstructions(proc.instructions, opts.instructions)) continue
+    if (!proc.hasSentFirstTurn) continue
+    if (!isContinuedOpening(proc, first)) continue
+    const len = (proc.openingText || "").length
+    if (!best || len > bestLen) {
+      best = proc
+      bestLen = len
+      tied = false
+    } else if (len === bestLen) {
+      tied = true
+    }
+  }
+  return tied ? null : best
+}
+
+function rekeyProc(proc, newKey) {
+  if (!proc || proc.convKey === newKey) return proc
+  const oldKey = proc.convKey
+  dropFromPool(proc)
+  unpark(oldKey)
+  proc.convKey = newKey
+  pool.set(newKey, proc)
+  return proc
+}
+
+
 function historyKey(messages) {
   const rows = []
   const ids = new Map()
@@ -2604,7 +3081,7 @@ function historyKey(messages) {
         block.type === "tool_addition" || block.type === "tool_removal") continue
       let value
       if (typeof block === "string" || block.type === "text") {
-        value = { type: "text", text: stripMagpiePlaceholderNotice(typeof block === "string" ? block : block.text || "") }
+        value = { type: "text", text: stripVolatileOpening(stripMagpiePlaceholderNotice(typeof block === "string" ? block : block.text || "")) }
       } else if (block.type === "document") {
         value = { type: "text", text: parseUserDocumentText(block) }
       } else if (block.type === "search_result") {
@@ -2669,8 +3146,8 @@ function assistantTextOf(message) {
 // run: runStart = first message of the trailing text-only assistant run,
 // boundary = history split point (after the last assistant message before the
 // run, the session ledger's newest entry). Returns null when the request does
-// not end with a text-only assistant run. A tool result followed by a prefill
-// is replayed with its completed results in a fresh session. A run with
+// not end with a text-only assistant run. Known limits: a request combining a
+// live tool_result with a prefill tail is rejected in validateBody; a run with
 // no user message before it (contiguous assistant tail, e.g. a client re-sending
 // a completed reply with a prefill appended) puts the whole run in the tail, so
 // that one turn degrades to a fresh session (safe, self-healing).
@@ -2734,7 +3211,7 @@ function matchToolResults(body, blocks) {
 
 function systemText(body) {
   if (!body.system) return ""
-  return typeof body.system === "string" ? body.system : body.system.map((block) => block.text || "").join("")
+  return typeof body.system === "string" ? body.system : body.system.map((block) => block.text || "").join("\n")
 }
 
 function contentText(content) {
@@ -2780,20 +3257,24 @@ function compactIdentity(text) {
 }
 
 function sameInstructions(a, b) {
-  return compactIdentity(a) === compactIdentity(b)
+  return instructionsIdentity(a) === instructionsIdentity(b)
 }
 
 // The model is not part of the key: agy switches models inside a live session.
 function conversationKey(rawBody) {
   const body = canonicalBody(rawBody)
-  const system = historyKey([{ role: "system", content: compactIdentity(systemText(body)) }])
+  const system = historyKey([{ role: "system", content: compactIdentity(stripVolatileSystem(systemText(body))) }])
   const first = body.messages?.[0]
+  // Hash the whole stripped first message, including non-text blocks such as
+  // images. A shared 8 KiB text prefix must not put two chats in one session.
+  // Later assistant/user turns are not part of this hash, so attaching history
+  // does not change the key. Agent billing headers and opening reminder clocks
+  // are stripped; user text is not.
   const firstText = first ? historyKey([first]) : ""
   const discriminator = body.metadata?.user_id || ""
   const source = discriminator + "\n" + system + "\n===\n" + firstText
   return createHash("sha256").update(source).digest("hex")
 }
-
 function appendSchemaHint(node, hint) {
   if (!hint) return
   if (typeof node.description === "string" && node.description.trim()) {
@@ -2803,249 +3284,125 @@ function appendSchemaHint(node, hint) {
   }
 }
 
-// Resolve local references before agy's Schema translator sees them. Its
-// reference conversion can preserve an array's type but discard its items.
-// Only visit schema-bearing keywords, never examples/default argument data.
-function inlineInputSchemaReferences(root) {
-  let remaining = 50_000
-  function visit(schema, active = new Set(), depth = 0) {
-    if (!schema || typeof schema !== "object" || Array.isArray(schema)) return schema
-    if (depth > 64 || --remaining < 0) {
-      throw new UnsupportedContent("a tool schema exceeding local reference expansion limits")
-    }
-    let out = { ...schema }
-    if (typeof schema.$ref === "string") {
-      const ref = schema.$ref
-      if (active.has(ref)) throw new UnsupportedContent(`a recursive tool schema reference ${ref}`)
-      if (ref !== "#" && !ref.startsWith("#/")) {
-        throw new UnsupportedContent(`an external tool schema reference ${ref}`)
+
+// Sanitize JSON Schema constructs that agy's ACP -> Google Code Assist translator
+// converts into invalid Schema protos (e.g. union types leaving stale array/object
+// keywords, or non-string/empty enum entries producing `enum[0]: cannot be empty`).
+function sanitizeInputSchema(schema) {
+  if (!schema || typeof schema !== "object" || Array.isArray(schema)) return schema
+  const out = { ...schema }
+
+  if (Array.isArray(out.type)) {
+    const types = out.type.filter((item) => typeof item === "string")
+    const nullable = types.includes("null")
+    const nonNull = types.filter((item) => item !== "null")
+    if (nonNull.length > 1) {
+      let chosen = nonNull[0]
+      if (nonNull.includes("array") && out.items !== undefined) chosen = "array"
+      else if (nonNull.includes("object") && (out.properties !== undefined || out.additionalProperties !== undefined)) {
+        chosen = "object"
       }
-      let target = root
-      if (ref !== "#") {
-        let parts
-        try { parts = decodeURIComponent(ref.slice(2)).split("/").map(part => part.replace(/~1/g, "/").replace(/~0/g, "~")) }
-        catch { throw new UnsupportedContent(`an invalid tool schema reference ${ref}`) }
-        for (const key of parts) {
-          if (!target || typeof target !== "object" || !Object.hasOwn(target, key)) {
-            throw new UnsupportedContent(`an unresolved tool schema reference ${ref}`)
-          }
-          target = target[key]
-        }
-      }
-      const resolved = visit(target, new Set(active).add(ref), depth + 1)
-      if (!resolved || typeof resolved !== "object" || Array.isArray(resolved)) {
-        throw new UnsupportedContent(`a non-object tool schema reference ${ref}`)
-      }
-      out = { ...resolved, ...out }
-      // JSON Schema reference siblings are conjunctive. Preserve properties and
-      // required fields supplied by either side.
-      if (resolved.properties && schema.properties) out.properties = { ...resolved.properties, ...schema.properties }
-      if (resolved.required || schema.required) out.required = [...new Set([...(resolved.required || []), ...(schema.required || [])])]
-      delete out.$ref
+      out.type = nullable ? [chosen, "null"] : chosen
+      appendSchemaHint(out, `Accepts types: ${types.join(" | ")}`)
+    } else if (nonNull.length === 1) {
+      out.type = nullable ? [nonNull[0], "null"] : nonNull[0]
     }
-    delete out.$defs
-    delete out.definitions
-    delete out.$schema
-    for (const key of ["properties", "patternProperties", "dependentSchemas"]) {
-      if (out[key] && typeof out[key] === "object" && !Array.isArray(out[key])) {
-        out[key] = Object.fromEntries(Object.entries(out[key]).map(([name, value]) => [name, visit(value, active, depth + 1)]))
-      }
-    }
-    for (const key of ["items", "additionalProperties", "contains", "not", "if", "then", "else", "propertyNames"]) {
-      if (Array.isArray(out[key])) out[key] = out[key].map(value => visit(value, active, depth + 1))
-      else if (out[key] && typeof out[key] === "object") out[key] = visit(out[key], active, depth + 1)
-    }
-    for (const key of ["allOf", "anyOf", "oneOf", "prefixItems"]) {
-      if (Array.isArray(out[key])) out[key] = out[key].map(value => visit(value, active, depth + 1))
-    }
-    return out
   }
-  return visit(root)
-}
 
-// Adapted from upstream PR #895, head 98287fbc19ec09307beee583920b090443608de3.
-// ide-tools passes through agy's JSON Schema -> CloudCode Schema translator.
-// Use a conservative subset here; the client remains responsible for validating
-// real arguments. Constraints that cannot be represented become model hints.
-const TYPES = new Set(["object", "array", "string", "number", "integer", "boolean"])
-const TEXT_FIELDS = ["title", "description", "format", "pattern"]
-const NUMBER_FIELDS = ["minimum", "maximum", "minLength", "maxLength", "minItems", "maxItems", "minProperties", "maxProperties"]
-const isObject = value => value !== null && typeof value === "object" && !Array.isArray(value)
+  const resolvedType = typeof out.type === "string"
+    ? out.type
+    : Array.isArray(out.type)
+      ? out.type.find((item) => item !== "null") || null
+      : null
 
-
-function appendHint(node, hint) {
-  if (!hint || node.description?.includes(hint)) return
-  node.description = node.description ? `${node.description} (${hint})` : hint
-}
-
-function summarize(value) {
-  const text = JSON.stringify(value)
-  return text?.length > 1500 ? text.slice(0, 1500) + "…" : text
-}
-
-function cleanTypeFields(out, pruneRequired = false) {
-  if (!out.type) return out
-  if (out.type !== "array") for (const key of ["items", "minItems", "maxItems"]) delete out[key]
-  if (out.type !== "object") {
-    for (const key of ["properties", "required", "minProperties", "maxProperties"]) delete out[key]
-  } else if (out.properties && pruneRequired) {
-    const required = [...new Set(out.required || [])].filter(key => Object.hasOwn(out.properties, key))
-    if (required.length) out.required = required
-    else delete out.required
+  if (resolvedType && resolvedType !== "array") {
+    delete out.items
+    delete out.prefixItems
+    delete out.minItems
+    delete out.maxItems
+    delete out.uniqueItems
+    delete out.contains
   }
-  if (out.type !== "string") for (const key of ["minLength", "maxLength", "pattern", "enum"]) delete out[key]
-  if (out.type !== "number" && out.type !== "integer") for (const key of ["minimum", "maximum"]) delete out[key]
+  if (resolvedType && resolvedType !== "object") {
+    delete out.properties
+    delete out.patternProperties
+    delete out.required
+    delete out.minProperties
+    delete out.maxProperties
+    delete out.dependentRequired
+  }
+
+  if (Array.isArray(out.enum)) {
+    const invalidEnum = out.enum.length === 0 ||
+      (resolvedType && resolvedType !== "string") ||
+      out.enum.some((item) => typeof item !== "string" || item.length === 0)
+    if (invalidEnum) {
+      if (out.enum.length) {
+        appendSchemaHint(out, `Allowed values: ${out.enum.map((item) => JSON.stringify(item)).join(", ")}`)
+      }
+      delete out.enum
+    }
+  }
+
+  if (out.const !== undefined && (typeof out.const !== "string" || out.const.length === 0 || (resolvedType && resolvedType !== "string"))) {
+    appendSchemaHint(out, `Must equal: ${JSON.stringify(out.const)}`)
+    delete out.const
+  }
+
+  if (out.properties && typeof out.properties === "object" && !Array.isArray(out.properties)) {
+    out.properties = Object.fromEntries(
+      Object.entries(out.properties).map(([key, value]) => [key, sanitizeInputSchema(value)]),
+    )
+    if (Array.isArray(out.required)) {
+      const filtered = out.required.filter((key) => typeof key === "string" && Object.hasOwn(out.properties, key))
+      if (filtered.length) out.required = filtered
+      else delete out.required
+    }
+  }
+  if (out.patternProperties && typeof out.patternProperties === "object" && !Array.isArray(out.patternProperties)) {
+    out.patternProperties = Object.fromEntries(
+      Object.entries(out.patternProperties).map(([key, value]) => [key, sanitizeInputSchema(value)]),
+    )
+  }
+  if (out.additionalProperties && typeof out.additionalProperties === "object" && !Array.isArray(out.additionalProperties)) {
+    out.additionalProperties = sanitizeInputSchema(out.additionalProperties)
+  }
+  if (Array.isArray(out.items)) {
+    out.items = out.items.map((item) => sanitizeInputSchema(item))
+  } else if (out.items && typeof out.items === "object") {
+    out.items = sanitizeInputSchema(out.items)
+  }
+  if (Array.isArray(out.prefixItems)) {
+    out.prefixItems = out.prefixItems.map((item) => sanitizeInputSchema(item))
+  }
+  for (const key of ["anyOf", "oneOf", "allOf"]) {
+    if (Array.isArray(out[key])) out[key] = out[key].map((item) => sanitizeInputSchema(item))
+  }
+  if (out.not && typeof out.not === "object" && !Array.isArray(out.not)) {
+    out.not = sanitizeInputSchema(out.not)
+  }
+  for (const defsKey of ["$defs", "definitions"]) {
+    if (out[defsKey] && typeof out[defsKey] === "object" && !Array.isArray(out[defsKey])) {
+      out[defsKey] = Object.fromEntries(
+        Object.entries(out[defsKey]).map(([key, value]) => [key, sanitizeInputSchema(value)]),
+      )
+    }
+  }
+  for (const key of ["propertyNames", "contains", "if", "then", "else", "unevaluatedProperties", "unevaluatedItems"]) {
+    if (out[key] && typeof out[key] === "object" && !Array.isArray(out[key])) {
+      out[key] = sanitizeInputSchema(out[key])
+    }
+  }
+  if (out.dependentSchemas && typeof out.dependentSchemas === "object" && !Array.isArray(out.dependentSchemas)) {
+    out.dependentSchemas = Object.fromEntries(
+      Object.entries(out.dependentSchemas).map(([key, value]) => [key, sanitizeInputSchema(value)]),
+    )
+  }
+  // agy (Go/RE2) will reject the whole toolbox if any pattern is only valid as
+  // ECMA-262. Translate or drop those patterns here; tool-call arguments in
+  // the response are plain JSON and do not need a reverse transform.
+  sanitizePatternFields(out)
   return out
-}
-
-// Alternatives share only common required fields; allOf requires their union.
-function mergeSchemas(schemas, intersection) {
-  const meaningful = schemas.filter(schema => Object.keys(schema).length)
-  if (!meaningful.length) return {}
-  if (meaningful.length === 1) return meaningful[0]
-  const out = { ...meaningful[0] }
-  const types = [...new Set(meaningful.map(schema => schema.type).filter(Boolean))]
-  if (types.length) out.type = types[0]
-  if (types.length > 1) appendHint(out, `Accepts types: ${types.join(" | ")}`)
-  for (const schema of meaningful.slice(1)) appendHint(out, schema.description)
-
-  const objects = meaningful.filter(schema => schema.properties)
-  if (objects.length) {
-    const keys = [...new Set(objects.flatMap(schema => Object.keys(schema.properties)))]
-    out.properties = Object.fromEntries(keys.map(key => [key, mergeSchemas(
-      objects.filter(schema => Object.hasOwn(schema.properties, key)).map(schema => schema.properties[key]), intersection,
-    )]))
-    const required = new Set(meaningful.flatMap(schema => schema.required || []))
-    out.required = [...required].filter(key => intersection || meaningful.every(schema => schema.required?.includes(key)))
-  }
-  const arrays = meaningful.filter(schema => schema.items)
-  if (arrays.length) out.items = mergeSchemas(arrays.map(schema => schema.items), intersection)
-  for (const key of NUMBER_FIELDS) {
-    const values = meaningful.map(schema => schema[key]).filter(value => value !== undefined)
-    if (!values.length || (!intersection && values.length !== meaningful.length)) {
-      delete out[key]
-      continue
-    }
-    const lower = key === "minimum" || key.startsWith("min")
-    out[key] = (lower === intersection ? Math.max : Math.min)(...values)
-  }
-  const enums = meaningful.filter(schema => schema.enum)
-  if (enums.length && (intersection || enums.length === meaningful.length)) {
-    const values = [...new Set(enums.flatMap(schema => schema.enum))]
-    out.enum = intersection ? values.filter(value => enums.every(schema => schema.enum.includes(value))) : values
-    if (!out.enum.length) delete out.enum
-  } else delete out.enum
-  // Branch-specific formats/patterns/defaults must not constrain every union arm.
-  for (const key of ["format", "pattern", "default"]) {
-    if (!intersection && meaningful.some(schema => JSON.stringify(schema[key]) !== JSON.stringify(out[key]))) delete out[key]
-    else if (intersection && out[key] === undefined) {
-      const source = meaningful.find(schema => schema[key] !== undefined)
-      if (source) out[key] = source[key]
-    }
-  }
-  return cleanTypeFields(out)
-}
-
-function resolvePointer(root, ref) {
-  if (ref === "#") return root
-  if (!ref.startsWith("#/")) return undefined
-  try {
-    let target = root
-    for (const part of decodeURIComponent(ref.slice(2)).split("/")) {
-      const key = part.replace(/~1/g, "/").replace(/~0/g, "~")
-      if ((!isObject(target) && !Array.isArray(target)) || !Object.hasOwn(target, key)) return undefined
-      target = target[key]
-    }
-    return target
-  } catch { return undefined }
-}
-
-function sanitizeInputSchema(root) {
-  let remaining = 2048
-  const fallback = hint => ({ type: "string", description: hint })
-  function visit(schema, depth = 0, active = new Set()) {
-    if (depth > 32 || --remaining < 0) return fallback("Schema expansion limit reached; follow the tool's original argument contract.")
-    if (!isObject(schema)) return fallback(schema === false ? "No value is allowed by the original schema." : "Accepts any JSON value.")
-    if (active.has(schema)) return fallback("Recursive schema; follow the tool's original argument contract.")
-    const nextActive = new Set(active).add(schema)
-    const child = value => visit(value, depth + 1, nextActive)
-    let out = {}
-    for (const key of TEXT_FIELDS) if (typeof schema[key] === "string") out[key] = schema[key]
-    for (const key of NUMBER_FIELDS) if (typeof schema[key] === "number" && Number.isFinite(schema[key])) out[key] = schema[key]
-    if (schema.default !== undefined) out.default = structuredClone(schema.default)
-
-    const types = (Array.isArray(schema.type) ? schema.type : [schema.type]).filter(type => TYPES.has(type))
-    if (types.length) {
-      out.type = types[0]
-      if (types.includes("array") && schema.items !== undefined) out.type = "array"
-      else if (types.includes("object") && (schema.properties !== undefined || schema.additionalProperties !== undefined)) out.type = "object"
-    }
-    if (Array.isArray(schema.type) && schema.type.length > 1) appendHint(out, `Accepts types: ${schema.type.join(" | ")}`)
-    const nullOnly = schema.type === "null" || (Array.isArray(schema.type) && schema.type.length === 1 && schema.type[0] === "null")
-    if (nullOnly || schema.nullable === true) appendHint(out, nullOnly ? "Must equal: null" : "Accepts null.")
-    if (isObject(schema.properties)) {
-      out.properties = Object.fromEntries(Object.entries(schema.properties).map(([key, value]) => [key, child(value)]))
-      out.type ??= "object"
-    }
-    if (Array.isArray(schema.required)) {
-      out.required = schema.required.filter(key => typeof key === "string")
-      out.type ??= "object"
-    }
-    const tuple = Array.isArray(schema.prefixItems) ? schema.prefixItems : Array.isArray(schema.items) ? schema.items : null
-    if (tuple) {
-      out.items = tuple.length ? mergeSchemas(tuple.map(child), false) : fallback("Accepts any JSON value.")
-      appendHint(out, `Tuple positions: ${summarize(tuple)}`)
-      if (Array.isArray(schema.prefixItems) && schema.items !== undefined) appendHint(out, `Additional tuple items: ${summarize(schema.items)}`)
-      out.type ??= "array"
-    } else if (schema.items !== undefined) {
-      out.items = child(schema.items)
-      out.type ??= "array"
-    }
-    // additionalProperties/patternProperties are deliberately hints, since agy
-    // versions differ in their support even though newer Google protos allow them.
-    for (const key of ["additionalProperties", "patternProperties", "not", "contains", "uniqueItems", "dependentRequired", "if", "then", "else", "exclusiveMinimum", "exclusiveMaximum", "multipleOf"]) {
-      if (schema[key] !== undefined) appendHint(out, `${key}: ${summarize(schema[key])}`)
-    }
-    if (schema.additionalProperties !== undefined || schema.patternProperties !== undefined) out.type ??= "object"
-    if (typeof schema.$ref === "string") {
-      const target = resolvePointer(root, schema.$ref)
-      if (target !== undefined) out = mergeSchemas([child(target), out], true)
-      else appendHint(out, `Unresolved schema reference: ${schema.$ref}`)
-    }
-    for (const key of ["allOf", "anyOf", "oneOf"]) {
-      if (!Array.isArray(schema[key]) || !schema[key].length) continue
-      const branches = schema[key].filter(branch => key === "allOf" || branch?.type !== "null")
-      if (branches.length !== schema[key].length) appendHint(out, "Accepts null.")
-      if (branches.length) out = mergeSchemas([mergeSchemas(branches.map(child), key === "allOf"), out], true)
-      if (schema[key].length > 1) appendHint(out, `${key} constraints: ${summarize(schema[key])}`)
-    }
-
-    const values = Array.isArray(schema.enum) ? schema.enum : Object.hasOwn(schema, "const") ? [schema.const] : null
-    if (!out.type && values?.length) {
-      const value = values.find(value => value !== null)
-      const type = Array.isArray(value) ? "array" : typeof value
-      if (TYPES.has(type)) out.type = type
-    }
-    if (!out.type) {
-      out.type = depth === 0 ? "object" : "string"
-      if (!schema.type && !schema.$ref && !schema.anyOf && !schema.oneOf && !schema.allOf) appendHint(out, "Accepts any JSON value.")
-    }
-    if (values) {
-      if (out.type === "string" && values.length && values.every(value => typeof value === "string" && value.length)) out.enum = [...values]
-      else if (values.length) appendHint(out, `${Object.hasOwn(schema, "const") ? "Must equal" : "Allowed values"}: ${values.map(value => JSON.stringify(value)).join(", ")}`)
-    }
-    if (out.type === "array") out.items ??= fallback("Accepts any JSON value.")
-    if (out.type === "object") out.properties ??= {}
-    return cleanTypeFields(out)
-  }
-  // A required-only allOf branch may refer to properties supplied by a sibling.
-  // Prune dangling names only after every composition has been merged.
-  function finish(schema) {
-    if (schema.properties) Object.values(schema.properties).forEach(finish)
-    if (schema.items) finish(schema.items)
-    return cleanTypeFields(schema, true)
-  }
-  return finish(visit(root))
 }
 
 function normalizeTools(body) {
@@ -3054,7 +3411,6 @@ function normalizeTools(body) {
   if (choice === "none" || choice?.type === "none") return []
   const selected = choice?.type === "tool" ? choice.name : null
   const seen = new Set()
-  const aliases = new Set()
   const tools = []
   for (const tool of body.tools) {
     if (!tool || typeof tool.name !== "string" || !tool.name) {
@@ -3063,15 +3419,11 @@ function normalizeTools(body) {
     if (seen.has(tool.name)) throw new UnsupportedContent(`duplicate tool ${tool.name}`)
     seen.add(tool.name)
     if (selected && tool.name !== selected) continue
-    if ([SCHEMA_TOOL_NAME, CALL_TOOL_NAME].includes(tool.name)) throw new UnsupportedContent(`reserved bridge tool name ${tool.name}`)
-    const alias = bridgeToolName(tool.name)
-    if (aliases.has(alias)) throw new UnsupportedContent(`colliding bridge tool name ${alias}`)
-    aliases.add(alias)
     const rawSchema = tool.input_schema ?? { type: "object", properties: {} }
     if (!rawSchema || typeof rawSchema !== "object" || Array.isArray(rawSchema)) {
       throw new UnsupportedContent(`an invalid schema for tool ${tool.name}`)
     }
-    const inputSchema = sanitizeInputSchema(inlineInputSchemaReferences(rawSchema))
+    const inputSchema = ensureGeminiArrayItems(sanitizeInputSchema(rawSchema))
     tools.push({
       name: tool.name,
       description: typeof tool.description === "string" ? tool.description : "",
@@ -3268,7 +3620,9 @@ function renderTurnMessage(message) {
 
 function renderTurnMessageParts(message) {
   if (message.role !== "user" || !Array.isArray(message.content)) {
-    const text = renderTurnMessage(message)
+    let text = renderTurnMessage(message)
+    // a system or developer message later in the chat is system text too
+    if (message.role === "system" || message.role === "developer") text = cloak(text)
     return text === "" ? [] : [{ type: "text", text }]
   }
   const parts = []
@@ -3429,7 +3783,7 @@ function renderInitialPromptParts(body, callerWorkDir, instructionsInSession, re
   const head = []
   if (!instructionsInSession) {
     const system = systemText(body)
-    if (system.trim()) appendPrompt(head, `<external_system_instructions>\n${system}\n</external_system_instructions>\n`)
+    if (system.trim()) appendPrompt(head, `<external_system_instructions>\n${cloak(system)}\n</external_system_instructions>\n`)
     if (callerWorkDir) appendPrompt(head, `\n${workDirNote(callerWorkDir)}\n\n`)
   }
   const currentParts = renderTurnMessagesParts(current)
@@ -3643,10 +3997,6 @@ const UNCLOSED_NOTICE_RE = new RegExp(
   `<\\/?(?:${NOTICE_TAG_NAMES}|task-notification|system-reminder)\\b`,
 )
 
-// DSH emits this plain-text clock snapshot between tool steps, with role user.
-// It is client context, not a new instruction or part of the command's output.
-const DSH_TIME_CONTEXT_RE = /^Time sampled while preparing turn \d+, step \d+: \d{4}-\d{2}-\d{2}T[^\r\n]+\nBrowser time zone for this request: [^\r\n]+\. Interpret otherwise-unqualified dates and times in this zone\.\nElapsed since the preceding (?:step context|model-visible message): [^\r\n]+\.?$/
-
 // Forward complete protocol-generated context notices, Claude Code hook outputs,
 // and tool-companion blocks without turning arbitrary inline user instructions
 // into MCP function_response text. Mid-turn queued_command prompts and follow-up
@@ -3682,18 +4032,20 @@ function inspectToolTurn(results, body) {
       }
       if (block?.type === "image") {
         if (!seenResult) {
-          throw new UnsupportedContent("text beside a live tool_result; send it after the tool response completes")
+          // Same replay path as ordinary text before a live tool_result.
+          // Keep the image on the request body so the new prompt can carry it;
+          // never splice it into an MCP function response that has no result yet.
+          userSteered = true
+          continue
         }
         out = appendResultPart(out, resultIndex, parseUserImage(block))
         continue
       }
       const rawText = blockText(block)
-      if (message.role === "user" && DSH_TIME_CONTEXT_RE.test(rawText.trim())) {
-        notices.push(rawText.trim())
-        continue
-      }
       if (!seenResult && message.role === "user" && rawText.trim()) {
-        throw new UnsupportedContent("text beside a live tool_result; send it after the tool response completes")
+        // A user can steer a pending tool turn from either side of a tool_result.
+        // Replay the instruction as a user prompt, never as an MCP tool response.
+        userSteered = true
       }
       const text = stripMagpiePlaceholderNotice(rawText)
       if (text !== rawText && !notices.includes(MAGPIE_PLACEHOLDER_NOTICE)) {
@@ -3753,21 +4105,44 @@ function inspectToolTurn(results, body) {
       }
       const rest = withoutNotices.replace(SYSTEM_REMINDER_RE, "").trim()
       if (UNCLOSED_NOTICE_RE.test(rest)) {
-        throw new UnsupportedContent("text beside a live tool_result; send it after the tool response completes")
+        // Text that merely names a notice tag it does not close (a developer
+        // message that quotes <system-reminder>, a user typing one, a hook's
+        // context) is routed by who wrote it, never refused and never dropped.
+        // A notice that opens and is cut short is still turned away.
+        const wrapped = /^<system-reminder(?:\s[^>]*)?>\s*([\s\S]*?)\s*<\/system-reminder>$/.exec(trimmed)
+        if (!wrapped && PROTOCOL_NOTICE_START_RE.test(rest)) {
+          // a protocol notice that starts and is cut short: not a mention
+          throw new UnsupportedContent("text beside a live tool_result; send it after the tool response completes")
+        }
+        if (wrapped || message.role === "system" || message.role === "developer") {
+          // the gateway's wrapper for a developer message, or a system one
+          const inner = wrapped ? wrapped[1] : rest
+          if (extractQueuedPrompt(inner) !== null || userInterruption.test(inner)) userSteered = true
+          else if (!isNoise(inner)) notices.push(cloak(inner))
+        } else if (message.role === "user") {
+          userSteered = true
+        } else if (!isNoise(rest)) {
+          notices.push(cloak(rest))
+        }
+        continue
       }
       if (message.role === "system" || message.role === "developer") {
         if (extractQueuedPrompt(rest) !== null || userInterruption.test(rest)) {
           userSteered = true
         } else if (!isNoise(rest)) {
-          notices.push(rest)
+          notices.push(cloak(rest))
         }
       } else if (!isNoise(rest)) {
         if ((hookOutput.test(rest) || claudeMetaFeedback.test(rest)) && !userInterruption.test(rest)) {
           notices.push(rest)
-        } else if (userSteered || stoppedByHookOrUser || notices.some((item) => hookStoppedContinuation.test(item))) {
+        } else if (message.role === "user" || (message.role === "assistant" && prefillTailEnabled() && prefillRun(body.messages)) ||
+          userSteered || stoppedByHookOrUser ||
+          notices.some((item) => hookStoppedContinuation.test(item))) {
           userSteered = true
         } else {
-          throw new UnsupportedContent("text beside a live tool_result; send it after the tool response completes")
+          // text from neither the user nor the system (an assistant message
+          // that landed after the result): the model is told it, as a notice
+          notices.push(cloak(rest))
         }
       }
     }
@@ -3782,11 +4157,10 @@ function withContextNotices(results, body) {
   return inspectToolTurn(results, body).results
 }
 
-// Follow-up instructions and assistant prefills cannot be sent as the result of
-// an MCP call. Once the complete result batch has been validated, replay it with
-// the follow-up in a fresh session. Clients may put the follow-up in the same
-// user content array as the results, or in a separate user/assistant message.
-// Keep the original body for replay; the split below only validates the boundary.
+// When a previous tool-result HTTP request failed or was aborted before producing
+// an assistant message, and the user subsequently enters a new standalone user
+// message after the tool_result message, replay in a fresh session instead of
+// wedging the conversation with HTTP 400.
 function canReplayFollowUpAfterResults(body, rawResults) {
   // A follow-up must not discard the unanswered half of a parallel tool batch.
   if (replayHistoryProblem(body, rawResults.map((item) => item.block))) return false
@@ -3817,6 +4191,9 @@ function canReplayFollowUpAfterResults(body, rawResults) {
     withContextNotices(rawResults, { ...body, messages: [...history, ...prefix] })
     for (const message of tail) {
       const rest = messageText(message).replace(CONTEXT_NOTICE_RE, "").replace(SYSTEM_REMINDER_RE, "")
+      // Reserved companions require their original tool association; they are
+      // not standalone user instructions eligible for the prefill fallback.
+      if (/^(?:ARGUMENTS:|Tool loaded\.|\[Image:)/.test(rest.trim())) return false
       if (UNCLOSED_NOTICE_RE.test(rest)) return false
     }
   } catch {
@@ -3920,11 +4297,7 @@ function handleControlConnection(socket) {
         return
       }
       if (message.kind === "call") {
-        proc.acceptMcpCall(message, socket).catch(error => {
-          if (!socket.destroyed) socket.end(JSON.stringify({
-            error: { code: -32603, message: String(error?.message ?? error) },
-          }) + "\n")
-        })
+        proc.acceptMcpCall(message, socket)
         return
       }
       socket.end(JSON.stringify({ error: { code: -32601, message: "unknown control request" } }) + "\n")
@@ -3947,21 +4320,69 @@ function tokenCount(value) {
   return Number.isFinite(number) ? Math.min(Number.MAX_SAFE_INTEGER, Math.max(0, Math.round(number))) : 0
 }
 
-// ACP usage accumulates the internal model calls of one session/prompt.
-// Gemini includes read-cache input and excludes thought output in its totals.
-function translateUsage(usage) {
-  if (!usage || typeof usage !== "object") return null
-  const input = tokenCount(usage.inputTokens)
-  const cacheRead = Math.min(input, tokenCount(usage.cachedReadTokens))
-  const thinking = tokenCount(usage.thoughtTokens)
-  return {
-    input_tokens: input - cacheRead,
-    output_tokens: tokenCount(tokenCount(usage.outputTokens) + thinking),
-    cache_read_input_tokens: cacheRead,
-    cache_creation_input_tokens: tokenCount(usage.cachedWriteTokens),
-    ...(thinking > 0 ? { output_tokens_details: { thinking_tokens: thinking } } : {}),
-  }
+// ACP reports uncached input and cached reads as independent counters.
+const FIELDS = ["input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens", "output_tokens"]
+
+
+function hasCount(object, field) {
+  const value = object?.[field]
+  return (typeof value === "number" || (typeof value === "string" && value.trim() !== "")) &&
+    Number.isFinite(Number(value)) && Number(value) >= 0
 }
+
+function safeAdd(first, second) {
+  return tokenCount(tokenCount(first) + tokenCount(second))
+}
+
+function copyUsage(usage) {
+  const result = Object.fromEntries(FIELDS.map(field => [field, tokenCount(usage?.[field])]))
+  const thinking = Math.min(result.output_tokens, tokenCount(usage?.output_tokens_details?.thinking_tokens))
+  if (thinking > 0) result.output_tokens_details = { thinking_tokens: thinking }
+  return result
+}
+
+function normalizeAcpUsage(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null
+  if (!["inputTokens", "cachedReadTokens", "cachedWriteTokens", "outputTokens", "thoughtTokens"].some(field => hasCount(raw, field))) return null
+  const thinking = tokenCount(raw.thoughtTokens)
+  return copyUsage({
+    input_tokens: tokenCount(raw.inputTokens),
+    cache_read_input_tokens: tokenCount(raw.cachedReadTokens),
+    cache_creation_input_tokens: tokenCount(raw.cachedWriteTokens),
+    output_tokens: Math.max(tokenCount(raw.outputTokens), thinking),
+    output_tokens_details: { thinking_tokens: thinking },
+  })
+}
+
+function cacheReadRatio(raw) {
+  if (!hasCount(raw, "inputTokens") || !hasCount(raw, "cachedReadTokens")) return undefined
+  const input = tokenCount(raw.inputTokens)
+  const read = tokenCount(raw.cachedReadTokens)
+  return input + read > 0 ? read / (input + read) : undefined
+}
+
+
+
+
+
+function estimateStepUsage({ inputEstimate = 0, inputTokenScale = 1, lastCacheRatio, priorUsages = [], outputEstimate = 0, thinkingEstimate = 0 } = {}) {
+  const scale = Number.isFinite(inputTokenScale) ? Math.max(0.5, Math.min(1.5, inputTokenScale)) : 1
+  const window = tokenCount(tokenCount(inputEstimate) * scale)
+  const prefix = priorUsages.reduce((largest, usage) => Math.max(largest,
+    tokenCount(usage?.input_tokens) + tokenCount(usage?.cache_read_input_tokens) + tokenCount(usage?.cache_creation_input_tokens)), 0)
+  const ratio = Number.isFinite(lastCacheRatio) ? Math.max(0, Math.min(1, lastCacheRatio)) : window > 0 ? Math.min(1, prefix / window) : 0
+  const read = Math.min(window, tokenCount(window * ratio))
+  return copyUsage({
+    input_tokens: window - read,
+    cache_read_input_tokens: read,
+    cache_creation_input_tokens: 0,
+    output_tokens: tokenCount(outputEstimate),
+    output_tokens_details: { thinking_tokens: tokenCount(thinkingEstimate) },
+  })
+}
+
+
+function translateUsage(usage) { return normalizeAcpUsage(usage) }
 
 function responseOutputEstimate(content) {
   let output = 0
@@ -3980,60 +4401,53 @@ function responseOutputEstimate(content) {
   return { output: tokenCount(output), thinking: tokenCount(thinking) }
 }
 
-// Usage for one HTTP response. ACP reports one accumulated total for a whole
-// session/prompt, which may span several HTTP responses (tool round-trips and
-// late tool results). Reporting that total on the last response makes clients
-// bill the earlier steps again, so each response settles on its own:
-//   - a lone model call keeps the exact ACP numbers;
-//   - tool-step responses get a non-zero estimate scaled by what earlier
-//     responses taught us about this model's tokenizer and cache hit rate;
-//   - the final response gets the ACP input total split by this step's share
-//     of the estimated input, never above 1.5x its own estimate.
-function responseUsage(proc, turn, step, content, result) {
+// Prefer model-call usage from AGY's local transcript. ACP prompt totals
+// span tool round trips: retain them in rawAcpUsages, never present a multi-call
+// total as the last model's context window. Missing transcripts use a labeled,
+// bounded window estimate; a single-call prompt can use exact ACP counters.
+async function responseUsage(proc, turn, step, content, result) {
   if (step.settled) return step.usage
   const final = result !== undefined
+  const recorded = await proc.transcriptUsage?.read()
+  if (recorded && recorded.steps.length === 1) {
+    step.usageKind = "exact_model_step"
+    step.modelSteps = recorded.steps
+    return recorded.usage
+  }
+  if (recorded && recorded.steps.length > 1) {
+    step.modelSteps = recorded.steps
+    step.modelUsageAggregate = recorded.usage
+    logBridgeEvent(proc, turn, "model_usage_batch", "multiple_calls_use_bounded_window", {}, { model_steps: recorded.steps, aggregate_usage: recorded.usage })
+  }
   const translated = final ? translateUsage(result?.usage) : null
-  const single = final && result?.stopReason !== "cancelled" && !turn.calls.length &&
+  const single = !recorded && final && result?.stopReason !== "cancelled" && !turn.calls.length &&
     !turn.toolResponseCount && !turn.hasLatePrompt && turn.promptCount <= 1 && turn.responseSteps.length === 1
-  step.usageKind = single && translated ? "exact" : "bounded_step_estimate"
-  if (single && translated) return translated
-
+  if (single && translated) { step.usageKind = "exact_single_prompt"; return translated }
   const estimate = turn.stepInputEstimates[step.estimateIndex] || step.inputEstimate
-  const scale = Number.isFinite(proc.inputTokenScale) ? Math.max(0.5, Math.min(1.5, proc.inputTokenScale)) : 1
-  let cacheRatio = Number.isFinite(proc.lastCacheRatio) ? Math.max(0, Math.min(1, proc.lastCacheRatio)) : 0
-  let input = Math.max(1, tokenCount(estimate * scale))
-  let write = 0
-  if (final) {
-    const sum = turn.stepInputEstimates.reduce((total, value) => total + value, 0)
-    const weight = estimate / Math.max(estimate, sum)
-    const totalInput = tokenCount(result?.usage?.inputTokens)
-    const totalWrite = tokenCount(result?.usage?.cachedWriteTokens)
-    const read = Math.min(totalInput, tokenCount(result?.usage?.cachedReadTokens))
-    if (totalInput + totalWrite > 0) {
-      input = tokenCount(totalInput * weight)
-      write = tokenCount(totalWrite * weight)
-      cacheRatio = totalInput > 0 ? read / totalInput : 0
-    }
-    // The bound applies to the full window, including cache creation. Scale
-    // both portions together before rounding, then split the exact integer.
-    const combined = input + write
-    const bounded = Math.min(tokenCount(estimate * 1.5), combined)
-    write = combined > 0 ? Math.min(bounded, tokenCount(bounded * (write / combined))) : 0
-    input = bounded - write
-  }
-  const read = Math.min(input, tokenCount(input * cacheRatio))
+  const previous = turn.responseSteps.filter(item => item !== step && item.settled)
   const emitted = responseOutputEstimate(content)
-  const output = final
-    ? Math.max(emitted.output, tokenCount((translated?.output_tokens || 0) - turn.emittedOutputTokens))
-    : Math.max(1, emitted.output)
-  const thinking = Math.min(output, emitted.thinking)
-  return {
-    input_tokens: input - read,
-    cache_read_input_tokens: read,
-    cache_creation_input_tokens: write,
-    output_tokens: output,
-    ...(thinking > 0 ? { output_tokens_details: { thinking_tokens: thinking } } : {}),
+  const guess = estimateStepUsage({ inputEstimate: estimate, inputTokenScale: proc.inputTokenScale,
+    lastCacheRatio: proc.lastCacheRatio, priorUsages: previous.map(item => item.usage),
+    outputEstimate: emitted.output, thinkingEstimate: emitted.thinking })
+  if (final && translated) {
+    const totalWindow = translated.input_tokens + translated.cache_read_input_tokens + translated.cache_creation_input_tokens
+    const totalEstimate = turn.stepInputEstimates.reduce((sum, value) => sum + value, 0)
+    if (totalWindow > 0) {
+      const window = Math.min(tokenCount(estimate * 1.5), tokenCount(totalWindow * estimate / Math.max(estimate, totalEstimate)))
+      const write = Math.min(window, tokenCount(window * translated.cache_creation_input_tokens / totalWindow))
+      const readWindow = window - write
+      const rawReadWindow = translated.input_tokens + translated.cache_read_input_tokens
+      const read = rawReadWindow > 0 ? Math.min(readWindow, tokenCount(readWindow * translated.cache_read_input_tokens / rawReadWindow)) : 0
+      guess.input_tokens = readWindow - read
+      guess.cache_read_input_tokens = read
+      guess.cache_creation_input_tokens = write
+    }
+    // A cumulative ACP output residual is not this response's output.
+    guess.output_tokens = Math.max(1, emitted.output)
   }
+  step.usageKind = "bounded_step_estimate"
+  step.usageEstimate = guess
+  return guess
 }
 
 // agy's ACP stream carries thought summaries without the model's own signature.
@@ -4108,6 +4522,8 @@ function makeAnthropicStream(proc, turn, body, msgId, signal, step = turn.regist
         send("content_block_start", {
           type: "content_block_start",
           index: blockIndex,
+          // Schema sanitization is outbound only: tool_use carries id, name, and
+          // JSON arguments, never the parameter schema, so nothing is rewritten here.
           content_block: { type: "tool_use", id: call.id, name: call.name, input: {} },
         })
         send("content_block_delta", {
@@ -4212,7 +4628,7 @@ function makeAnthropicStream(proc, turn, body, msgId, signal, step = turn.regist
               }
               if (performance.now() >= batchDeadline) break
             }
-            stopMessage("tool_use", responseUsage(proc, turn, step, responseContent))
+            stopMessage("tool_use", await responseUsage(proc, turn, step, responseContent))
             proc.recordAssistantResponse(turn, responseContent)
             detach()
             controller.close()
@@ -4221,7 +4637,7 @@ function makeAnthropicStream(proc, turn, body, msgId, signal, step = turn.regist
           if (event.type === "result") {
             closeBlock()
             turn.rawUsage = event.result.usage ?? turn.rawUsage
-            const usage = responseUsage(proc, turn, step, responseContent, event.result)
+            const usage = await responseUsage(proc, turn, step, responseContent, event.result)
             stopMessage(STOP_REASONS[event.result.stopReason] || "end_turn", usage, true, event.result.stopReason !== "cancelled")
             proc.recordAssistantResponse(turn, responseContent)
             proc.finalizeTurn(turn)
@@ -4420,10 +4836,22 @@ function streamResponse(proc, turn, body, signal) {
   })
 }
 
-async function beginTurn(proc, history, body, callerWorkDir, model, selection) {
+// Cancelling an ACP prompt can race with delivery of an MCP reply. Preserve
+// the newly completed results in the steer's next prompt as receipts; reuse
+// the same session and never replay the older conversation or execute tools.
+function withSteerReceipts(messages, answered) {
+  if (!answered?.size) return messages
+  return [{ role: "user", content: "The following client tool calls have already completed. Their real results are included below because generation was interrupted. Use these results; do not execute these calls again." }, ...messages]
+}
+
+async function beginTurn(proc, history, body, callerWorkDir, model, selection, answered) {
   const reminder = outputFormatReminder(body)
+  const flattened = proc.pendingFlattenedTurn
+  proc.pendingFlattenedTurn = null
   const baseParts = proc.hasSentFirstTurn
-    ? renderContinuedTurnParts(body.messages.slice(history.length))
+    ? renderContinuedTurnParts(flattened
+      ? [flattened, ...body.messages.slice(1)]
+      : withSteerReceipts(body.messages.slice(history.length), answered))
     : renderInitialPromptParts(body, callerWorkDir, proc.instructionsInSession,
       reminder.length ? promptTextBytes(reminder) + 2 : 0)
   const contentParts = mergePromptParts(baseParts, reminder)
@@ -4559,8 +4987,10 @@ export const AntigravityBridgePlugin = async () => {
               }
               const acquireOpts = { model, selection, tools, workDir, instructions, history: trailing.history,
                 messages: body.messages, layout, nonstream: body.stream === false, reqId, convKey,
-                hasToolResults: resultBlocks.length > 0 }
-              const begin = (proc, history) => beginTurn(proc, history, body, callerWorkDir, model, selection)
+                hasToolResults: resultBlocks.length > 0, userId: body.metadata?.user_id || "" }
+              let answeredIds = null
+              const begin = (proc, history) => beginTurn(proc, history, body, callerWorkDir, model, selection, answeredIds)
+              let keptSession = false
               if (resultBlocks.length) {
                 const matches = matchToolResults(body, resultBlocks)
                 const found = matches.filter((item) => item.match)
@@ -4582,6 +5012,12 @@ export const AntigravityBridgePlugin = async () => {
                     result: toolResult(block),
                   }))
                   proc.validateResults(rawResults)
+                  // A prefilled assistant continuation cannot settle a partial
+                  // parallel batch: preserve the owner until every result arrives.
+                  if (prefillTailEnabled() && prefillRun(body.messages) &&
+                    pendingCallCount(turn) > new Set(rawResults.map(item => item.call.id)).size) {
+                    return jsonError(400, "agy bridge: missing pending tool results before assistant prefill")
+                  }
                   let interrupted = isInterruptedToolTurn(body)
                   let results = rawResults
                   if (!interrupted) {
@@ -4602,19 +5038,32 @@ export const AntigravityBridgePlugin = async () => {
                   const historyMatches = directIdsMatch
                     ? proc.matchesPendingTurnHistory(turn, trailingMessages(body).history)
                     : proc.matchesHistory(trailingMessages(body).history)
-                  if (interrupted || !historyMatches ||
+                  // A steer keeps the live session, so agy's prompt cache holds: the
+                  // calls are answered with their real results, the step is
+                  // cancelled, and the steer goes in as the next prompt.
+                  if (interrupted && historyMatches && !proc.toolsGrew(tools) && proc.workDir === workDir &&
+                    sameInstructions(proc.instructions, instructions) &&
+                    await proc.steerInSession(turn, rawResults, trailingMessages(body).history)) {
+                    logBridgeEvent(proc, turn, "session_steered", "follow_up_in_session", acquireOpts)
+                    keptSession = true
+                    answeredIds = new Set(rawResults.map((item) => item.block.tool_use_id))
+                  } else if (interrupted || !historyMatches || proc.toolsGrew(tools) ||
                     proc.workDir !== workDir || !sameInstructions(proc.instructions, instructions)) {
-                    // A changed context or user-interrupted tool turn needs a new
-                    // session. Replay the real results without resolving the old
-                    // process's calls.
+                    // A changed context, a tool catalog that grew, or a
+                    // user-interrupted tool turn needs a new session. Replay the
+                    // real results without resolving the old process's calls.
+                    logBridgeEvent(proc, turn, "session_replaced", !historyMatches ? "tool_history_mismatch" :
+                      proc.toolsGrew(tools) ? "tools_grew" : proc.workDir !== workDir ? "work_directory_changed" :
+                      !sameInstructions(proc.instructions, instructions) ? "instructions_changed" : "steer_requires_replay", acquireOpts)
                     dropFromPool(proc)
                     proc.abandonTurn(turn)
                     await proc.stop()
                   } else {
                     if (!proc.dead && !turn.done) {
-                      // A changed tool catalog applies to the rest of this turn;
-                      // a model change applies from the next prompt.
+                      // A tool catalog that lost or changed tools applies to the
+                      // rest of this turn; a model change applies from the next prompt.
                       await proc.updateTools(tools)
+                      logBridgeEvent(proc, turn, "tool_continued", "compatible_tool_result", acquireOpts)
                       proc.continueWith(results)
                       proc.recordToolResults(turn, body.messages)
                     }
@@ -4668,7 +5117,7 @@ export const AntigravityBridgePlugin = async () => {
                 convKey,
                 acquireOpts,
                 isFresh,
-                resultBlocks.length > 0,
+                resultBlocks.length > 0 && !keptSession,
               )
               const turn = await begin(proc, history)
               return streamResponse(proc, turn, body, init.signal)
@@ -4711,8 +5160,8 @@ export const AntigravityBridgePlugin = async () => {
   }
 }
 
-// Tool-history errors and unavailable tool catalogs opt out of blind retries.
-// Busy responses and existing 409s retain their semantics.
+// Only permanent tool-history 400s opt out of retries. Magpie header forwarding
+// has not been verified; busy responses and existing 409s retain their semantics.
 // `extra` merges diagnostic fields (attempts, turn_id) into the error object.
 function jsonError(status, message, code, { extra, headers, noRetry = false } = {}) {
   return new Response(
@@ -4722,20 +5171,39 @@ function jsonError(status, message, code, { extra, headers, noRetry = false } = 
         ...(code ? { code } : {}), message: String(message || "unknown error"), ...(extra ?? {}) },
     }),
     { status, headers: { "Content-Type": "application/json",
-      ...(noRetry && (status === 400 || code === "bridge_tools_unavailable") ? NO_RETRY_HEADERS : {}), ...(headers ?? {}) } },
+      ...(status === 400 && noRetry ? NO_RETRY_HEADERS : {}), ...(headers ?? {}) } },
   )
 }
 
-process.once("exit", () => {
+// On Windows child.kill() ends agy alone and leaves the cmd.exe and nc it
+// started, so one taskkill /T ends every tree before the workspaces go.
+function reapOnExit() {
+  const windows = process.platform === "win32"
+  const pids = []
   for (const proc of allProcs) {
-    try { proc.child?.kill("SIGKILL") } catch {}
-    if (proc.workspace) {
-      try { fs.rmSync(proc.workspace, { recursive: true, force: true }) } catch {}
+    const child = proc.child
+    if (!child || child.exitCode !== null || child.signalCode !== null) continue
+    if (windows && child.pid) pids.push(child.pid)
+    else {
+      try { child.kill("SIGKILL") } catch {}
     }
   }
-  if (shimDir) {
+  const kill = windows ? windowsTreeKill(pids) : null
+  if (kill) {
+    try { spawnSync(kill.file, kill.args, { stdio: "ignore", windowsHide: true, timeout: 10_000 }) } catch {}
+  }
+  for (const proc of allProcs) {
+    // A process that just ended can hold its cwd (the workspace) for a moment.
+    if (proc.workspace) {
+      try { fs.rmSync(proc.workspace, { recursive: true, force: true, maxRetries: windows ? 10 : 0, retryDelay: 50 }) } catch {}
+    }
+  }
+  if (shimDir && shimDirOwned) {
     try { fs.rmSync(shimDir, { recursive: true, force: true }) } catch {}
   }
-})
+}
 
+process.once("exit", reapOnExit)
+
+export { sanitizeInputSchema }
 export default { id: PROVIDER_ID, server: AntigravityBridgePlugin }

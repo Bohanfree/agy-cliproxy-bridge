@@ -1,41 +1,36 @@
 {
-  "sha256": {
-    "index.mjs": "fdbdd9301022624801295a6ef20c7937ae3bd05e0505963ac2b36cad52e6f396",
-    "platform.mjs": "ddaae7b777fd556f58755408348439b46a13a5c38dd5b10c296c93c515d5051a",
-    "usage.mjs": "e9972f15b3975cdf0b35e97b179ba4e149a5779c604ea5c30049846da742e4df",
-    "login.mjs": "8fc1aa0cd4f6b341db63a4916c3e0d405b9c325651c8fa2d560b1215fe5f4d78",
-    "mcp-server.mjs": "b0ef3568cc4361108c3db2c7bde8e02646b6a7b8610b015e0e8f129e32f0f926",
-    "package.json": "d7029c114cd3acffd5d30924a39994a66c12ce95181d26829ec5fdb4c1db364a",
-    "LICENSE": "46f74979a7382f51ececa310eb3f3bd2a04addcd2b4dc3e27721c8eada0a07bd",
-    "NOTICE.md": "361d09309e99bb18c8633a5441ed5e28e97a1bcdf04ceab38bdf86c09b565a6b"
-  },
   "upstream": {
     "repository": "https://github.com/magpie-community/plugins",
     "directory": "packages/agy-cli",
-    "package": "@magpie-community/opencode-agy-cli-auth",
-    "version": "0.1.3",
-    "notice": "agy-bridge/NOTICE.md"
+    "baseline_version": "0.1.19",
+    "baseline_commit": "445f4143de5cb8a423fc277935ce163c0b2896a3",
+    "selected_fixes_through": "0.1.25",
+    "head_commit": "fc87cc8855172122e52ad4e459e5a4155e460b9d"
   },
-  "baseline": "Patched MIT baseline plus the local v0.1.1 continuation-boundary patch.",
-  "baseline_sha256": {
-    "index.mjs": "db40414c59f84a339406a70f12bcb490ceacc332b87298d8090b7197be6c2619",
-    "platform.mjs": "ddaae7b777fd556f58755408348439b46a13a5c38dd5b10c296c93c515d5051a",
-    "usage.mjs": "e9972f15b3975cdf0b35e97b179ba4e149a5779c604ea5c30049846da742e4df",
+  "local_version": "0.1.25-local.20261112.1",
+  "changes": [
+    "Preserve production session continuity and tool-result receipts",
+    "Use AGY transcript model-step usage with bounded fallback; ACP input and cache counters remain independent",
+    "Port 0.1.21 notice handling, 0.1.22 output/thinking accounting, and 0.1.24-25 Windows shims",
+    "Reject assistant prefills with incomplete parallel tool results",
+    "Upstream 0.1.20 SQLite accounting is not integrated: production uses transcript accounting; 0.1.23 is specific to that SQLite path"
+  ],
+  "sha256": {
+    "LICENSE": "46f74979a7382f51ececa310eb3f3bd2a04addcd2b4dc3e27721c8eada0a07bd",
+    "NOTICE.md": "3a3df6156e5665e9b1be2c023e088834bc2f467b6c1f9d91800214bedd3b06ff",
+    "README.en.md": "6626368eae664f2ce68b492d9074991fee793b843baad0df02c1eb291d5e8026",
+    "README.md": "2af616cc68af14ed940a0d2485951623ddf2fe40a83d6360bf0eb50f48d6ad51",
+    "array-items.mjs": "3011ff536942008a83c290c33cda9f9fcb18c2db90cb7de810d7bd816e0aa563",
+    "cloak.mjs": "0b1eb82954fae76364b108adb20a769e10aeb811f052e5e6ab91b146b5c56ee1",
+    "index.mjs": "b071b56e81f9b874f3c639a039c61bedc8b374d81c4998999452dafab98765ef",
     "login.mjs": "8fc1aa0cd4f6b341db63a4916c3e0d405b9c325651c8fa2d560b1215fe5f4d78",
     "mcp-server.mjs": "b0ef3568cc4361108c3db2c7bde8e02646b6a7b8610b015e0e8f129e32f0f926",
-    "package.json": "d7029c114cd3acffd5d30924a39994a66c12ce95181d26829ec5fdb4c1db364a",
-    "LICENSE": "46f74979a7382f51ececa310eb3f3bd2a04addcd2b4dc3e27721c8eada0a07bd",
-    "NOTICE.md": "3a3df6156e5665e9b1be2c023e088834bc2f467b6c1f9d91800214bedd3b06ff"
-  },
-  "local_patches": [
-    {
-      "version": "0.1.1",
-      "date": "2026-11-11",
-      "files": [
-        "index.mjs",
-        "NOTICE.md"
-      ],
-      "description": "Replay complete tool results with inline follow-ups or assistant prefills; preserve ordinary continuations and incomplete-batch ownership."
-    }
-  ]
+    "opencode.mjs": "393d67697ed13d7985f46f15da9e46654085145be848a93a31cbf7174771e232",
+    "opencode2.mjs": "2fdc96a5b5a6e3d0528b625b0e8e5e4cd29324bc013e198d188d3840c6beaf51",
+    "package.json": "5fbf3dd5a511cb657bdb3238f5fd250a19276cd62291b5a9b8d41581ca1226bf",
+    "platform.mjs": "d02e3808844f42e3e81cadb622594c688596a9ad9cd4d8a2a3713d1a79bfcf69",
+    "re2-pattern.mjs": "fc404a4c8436bbeda00b0872c523b8472fcb31418a10d8b35d8107f687c8896f",
+    "transcript-usage.mjs": "d2d4d2b4acc9fa9b7ec6493b012f1e6804826fe7888cb18741888c99a35422a8",
+    "usage.mjs": "e9972f15b3975cdf0b35e97b179ba4e149a5779c604ea5c30049846da742e4df"
+  }
 }

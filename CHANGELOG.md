@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.2
+
+- Bring the previously deployed 0.1.19-based session and cache fixes into the public repository.
+- Port upstream 0.1.21 notice compatibility and 0.1.22 ACP output/thinking correction, while preserving assistant prefills and parallel tool-result safety.
+- Port Windows launcher fixes through upstream 0.1.25.
+- Retain our transcript model-step accounting: upstream 0.1.20 SQLite accounting and its 0.1.23 follow-up are not integrated.
+
 ## 0.1.1
 
 - Preserve the boundary between OpenAI tool results and following user instructions.

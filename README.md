@@ -125,3 +125,10 @@ docker compose -f compose.test.yaml down
 桥接核心来自 [`magpie-community/plugins` 的 `packages/agy-cli`](https://github.com/magpie-community/plugins/tree/main/packages/agy-cli)（`@magpie-community/opencode-agy-cli-auth` 0.1.3 的修正版），保留全部上游版权声明。具体基线、补丁说明与 SHA-256 清单见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)、[vendor/agy-bridge/NOTICE.md](vendor/agy-bridge/NOTICE.md) 和 [vendor/provenance.json](vendor/provenance.json)。
 
 AGY、Magpie、CLIProxyAPI 由各自项目维护，本仓库仅包含适配代码和所列 MIT 桥接源码。
+
+### Vendored AGY updates
+
+Version 0.1.2 incorporates the deployed 0.1.19-based session and cache fixes
+and selected upstream fixes through 0.1.25. The bridge retains its existing
+transcript-based model-step accounting; upstream SQLite-based usage accounting
+is not integrated. See `vendor/provenance.json` and `CHANGELOG.md`.

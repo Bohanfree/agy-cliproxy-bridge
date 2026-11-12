@@ -60,7 +60,8 @@ async function runScenario(t, {tail, stream = true, chat = false, compact = fals
   assert.equal(issued, 1, 'initial tool-producing prompt never runs twice');
   assert.equal(fs.readFileSync(output, 'utf8'), 'executed once\n');
   assert.equal(kit.promptSerial, 2, 'one initial prompt and exactly one continuation');
-  assert.equal(kit.acpSpawns.length, 2, 'old pending tool session is replaced once');
+  assert.equal(kit.acpSpawns.length, chat || compact ? 2 : 1,
+    'compatible continuations reuse the session; changed history replays once');
 }
 
 for (const stream of [false, true]) {
