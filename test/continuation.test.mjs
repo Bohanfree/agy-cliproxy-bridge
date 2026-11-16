@@ -13,18 +13,20 @@ async function runScenario(t, {tail, stream = true, chat = false, compact = fals
   t.after(() => kit.dispose());
   const output = path.join(kit.tmp, 'client-output.txt');
   let issued = 0;
+  let deliveredResults;
   kit.prompts.push(async agent => {
     issued++;
-    if (parallel) await agent.tools([['Read', {path: output}], ['Read', {path: output + '.second'}]]);
-    else await agent.tool('Read', {path: output});
+    if (parallel) deliveredResults = await agent.tools([['Read', {path: output}], ['Read', {path: output + '.second'}]]);
+    else deliveredResults = await agent.tool('Read', {path: output});
     await agent.text('ordinary completion');
     return {stopReason: 'end_turn', usage: exactUsage};
   });
   kit.prompts.push(async agent => {
     const prompt = joined(agent.prompt);
-    assert.ok(prompt.includes('CLIENT_RESULT_MARKER'), 'completed tool result survives replay');
+    const received = prompt + JSON.stringify(deliveredResults);
+    assert.ok(received.includes('CLIENT_RESULT_MARKER'), 'completed result reaches the session through MCP or replay');
     assert.ok(prompt.includes('FOLLOWUP_MARKER'), 'follow-up or prefill survives replay');
-    if (parallel) assert.ok(prompt.includes('SECOND_RESULT_MARKER'));
+    if (parallel) assert.ok(received.includes('SECOND_RESULT_MARKER'));
     if (tail === 'prefill' || tail === 'both') {
       assert.ok(prompt.includes('part of your own unfinished reply'), 'prefill stays a continuation carrier');
     }

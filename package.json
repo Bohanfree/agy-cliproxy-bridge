@@ -1,6 +1,6 @@
 {
   "name": "agy-cliproxy-bridge",
-  "version": "0.1.2",
+  "version": "0.1.5",
   "private": true,
   "description": "Connect the real Antigravity CLI ACP to CLIProxyAPI through an OpenAI-compatible HTTP adapter.",
   "type": "module",

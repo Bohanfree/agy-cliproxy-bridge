@@ -9,10 +9,18 @@ import os from "node:os"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
 import { createUsageReader } from "./usage.mjs"
+import { storeCatalogRows } from "./model-ids.mjs"
+import { backgroundBlocked, cannotSignIn, forgetStoredSignIn, storedEmail, storedSignInNow } from "./signin.mjs"
 import { sanitizePatternFields } from "./re2-pattern.mjs"
 import { startLogin } from "./login.mjs"
+import { accountsDir, currentHome, dropHome, homeIdOfAuth, homeOf, inAccount, newHome, tokenFile } from "./account.mjs"
+import { IMPORT_FROM, importedAccounts, tokenFileText } from "./import.mjs"
+import { AGY_MANUAL, installAgy, keepAgyCurrent } from "./install.mjs"
 import { ensureGeminiArrayItems } from "./array-items.mjs"
-import { cloak, hint, turnsAway } from "./cloak.mjs"
+import { expandToolSchema } from "./tool-schema.mjs"
+import { fitTools } from "./tool-budget.mjs"
+import { cloakUser, hint, outgoing, turnsAway } from "./cloak.mjs"
+import { modelUsageCursor, modelUsageAfter, sessionDbPath } from "./step-usage.mjs"
 
 const PROVIDER_ID = "agy-cli"
 // Client tools reach the session through a private `nc` placed first on agy's
@@ -71,6 +79,15 @@ function ideCallDeadline() {
   return positiveTimeout(process.env.AGY_BRIDGE_IDE_CALL_DEADLINE_MS, 150_000)
 }
 const CANCEL_SETTLE_MS = 15_000
+const MAX_MCP_COMMIT_WAIT_MS = 60_000
+function mcpCommitWaitMs() {
+  const raw = process.env.AGY_BRIDGE_MCP_COMMIT_WAIT_MS
+  if (raw !== undefined && raw.trim() !== "") {
+    const parsed = Number(raw)
+    if (Number.isFinite(parsed) && parsed >= 0) return Math.min(Math.floor(parsed), MAX_MCP_COMMIT_WAIT_MS)
+  }
+  return 5_000
+}
 const RECLAIM_STOP_TIMEOUT_MS = 10_000
 // Repeated unmatched tool results against the same turn that made no progress:
 // attempts below the limit stay 409 (a live turn may still be waiting), the
@@ -93,13 +110,55 @@ const ACP_LINE_LIMIT = 64 * 1024 * 1024
 const LOG_TAIL_BYTES = 256 * 1024
 const NPM_ANTHROPIC = "@ai-sdk/anthropic"
 const PING_INTERVAL_MS = 15_000
+// agy commits a model call to its conversation store just after the call ends.
+const STEP_USAGE_WAIT_MS = 1_000
+const STEP_USAGE_SAME_GEN_WAIT_MS = 75
+const STEP_USAGE_POLL_MS = 25
 // agy reports an upstream failure as an ordinary message chunk followed by end_turn.
-const AGENT_ERROR_MARKER = "\n⚠ Agent execution terminated due to error.\n"
-const AGENT_ERROR_CORE = AGENT_ERROR_MARKER.trim()
+// 1.5.8 words a connection that failed every retry, and a spent credit
+// balance, on their own (#1136). 1.5.9 ends a turn whose every retry got 429
+// with the upstream status itself (#1151).
+const AGENT_ERROR_MARKERS = [
+  "\n⚠ Agent execution terminated due to error.\n",
+  "\n⚠ There was a network issue connecting to the server, please try again.\n",
+  "\n⚠ Your AI credits balance is too low to continue.\n",
+  "\n⚠ RESOURCE_EXHAUSTED (code 429): Resource has been exhausted (e.g. check quota).\n",
+]
+const AGENT_ERROR_CORES = AGENT_ERROR_MARKERS.map((marker) => marker.trim())
+const CREDITS_CORE = AGENT_ERROR_CORES[2]
+// agy 1.5.8 writes each failed attempt of a model call into the reply as one
+// line, then tries again in the same turn (#1136). The line is agy's.
+const ATTEMPT_CORE = "⚠ API error (attempt "
+const ATTEMPT_MARKER = "\n" + ATTEMPT_CORE
+const ATTEMPT_LINE = /^⚠ API error \(attempt \d+\): ?(.*)$/
+// The bare 429 Antigravity answers a system prompt it turns away, whatever
+// quota is left. agy 1.5.9 retries it in the same turn with a banner each
+// time, and only ends the turn after its last retry: to the client the turn
+// hung (Lmohn39 on X, pi through agy-cli, 11-14). A banner with it ends the
+// turn at once, as the 429 ending would.
+const refused429 = (detail) => /code 429\b/i.test(detail) && /resource has been exhausted/i.test(detail)
+// agy writes this into the reply when the model's first call came back with
+// neither text nor tool calls, then calls the model again in the same turn.
+// It is agy's, not the model's, and the turn goes on (#1124).
+const RETRY_MARKER = "\n⚠ Model produced invalid output.\n"
+const RETRY_CORE = RETRY_MARKER.trim()
+const HOLD_MAX = Math.max(...AGENT_ERROR_MARKERS.map((marker) => marker.length)) - 1
 // Opt-in. The minimal agent drops agy's own prompt components (~8,400 input
 // tokens a model call, against ~500 without them), so the request goes upstream
 // with the client's system prompt in their place.
 const minimalAgent = () => process.env.AGY_BRIDGE_MINIMAL_AGENT === "1"
+// Opt-in. agy's ACP server offers to append the client's system prompt to
+// its own (session instructions), and Antigravity sends that upstream as
+// part of the system instruction, where Google's check turns away a widening
+// set of agents' identity lines with a bare 429 "Resource has been
+// exhausted" whatever quota is left: since 11-15 "You are an interactive
+// agent that helps users with software engineering tasks." even as "You're
+// …" (#1151), and with only agy's own prompt the same account answers
+// (bzs_1 on X, 11-15). The client's system prompt goes in the first user
+// turn instead, as <external_system_instructions>, where only Codex's GPT-5
+// lines were turned away (cloak.mjs, USER_TURNED_AWAY). AGY_BRIDGE_SYSTEM_APPEND=1
+// goes back to the session instructions.
+const systemAppend = () => /^(?:1|true|on|yes)$/i.test(process.env.AGY_BRIDGE_SYSTEM_APPEND || "")
 const FORWARD_THINKING = process.env.AGY_BRIDGE_THINKING !== "0"
 
 // Until `agy models` answers. Gemini only: agy's ACP server decides which other
@@ -143,8 +202,15 @@ function findAgy() {
   // LOCALAPPDATA, home): a cached path from an old environment may be gone.
   const home = os.homedir()
   const env = process.env
-  const searchKey = JSON.stringify([env.AGY_PATH, env.PATH, env.Path, env.LOCALAPPDATA, home])
-  if (cachedAgyPath && cachedAgySearchKey === searchKey) return cachedAgyPath
+  const searchKey = JSON.stringify([env.AGY_PATH, env.PATH, env.Path, env.LOCALAPPDATA, env.XDG_DATA_HOME, home])
+  // and whenever the path found is gone: an agy removed while magpie ran
+  // is installed again by the next sign-in, not spawned where it was
+  if (cachedAgyPath && cachedAgySearchKey === searchKey) {
+    try {
+      fs.accessSync(cachedAgyPath, fs.constants.X_OK)
+      return cachedAgyPath
+    } catch {}
+  }
   cachedAgyPath = null
   cachedAgySearchKey = searchKey
   const candidates = agyCandidates(env, home)
@@ -156,6 +222,82 @@ function findAgy() {
     } catch {}
   }
   return null
+}
+
+// agy loads the machine's own skills (~/.gemini/skills, ~/.agents/skills, …)
+// and its global MCP servers into an ACP session even when the agent says
+// inheritCustomizations: false. They share agy's 20,000-token customization
+// budget with the client's tools, and over it agy drops the largest tools
+// (plugins#1166). agy 1.5.9's acp takes --include-default-customizations=false,
+// but on Windows it still loaded all 120 of a user's skills; --gemini-dir
+// pointed at a folder of the bridge's own leaves them all out (the reporter
+// ran it: no skills, every client tool listed). agy's Google sign-in is in
+// the system keyring, not in that folder (signin.mjs), so it still applies;
+// with no keyring it is a file in the folder, and see fileSignIn.
+// An agy without these flags refuses to start on them, so each is passed
+// only when `agy acp --help` lists it. The answer is kept per binary (path,
+// mtime, size), so an agy update asks again; a probe that failed is asked
+// again.
+const acpHelpText = new Map()
+function acpHelp(agyPath) {
+  let key = agyPath
+  try {
+    const st = fs.statSync(agyPath)
+    key += `\0${st.mtimeMs}\0${st.size}`
+  } catch {}
+  let probe = acpHelpText.get(key)
+  if (!probe) {
+    probe = execOnce(agyPath, ["acp", "--help"], { timeoutMs: 10_000 }).then(({ err, stdout, stderr, timedOut }) => {
+      if (err || timedOut) acpHelpText.delete(key)
+      return stdout + stderr
+    })
+    acpHelpText.set(key, probe)
+  }
+  return probe
+}
+
+export function noDefaultCustomizationsArgs(agyPath) {
+  return acpHelp(agyPath).then((help) => (/--include-default-customizations\b/.test(help) ? ["--include-default-customizations=false"] : []))
+}
+
+// The bridge's own agy folder, kept across restarts so agy finds a
+// conversation again on session/resume. AGY_BRIDGE_GEMINI_DIR names another;
+// "default" (or 0, off, …) leaves agy on its own ~/.gemini, skills and all.
+export function bridgeGeminiDir(env = process.env) {
+  const named = env.AGY_BRIDGE_GEMINI_DIR || ""
+  if (/^(?:default|0|false|off|no|disabled)$/i.test(named)) return null
+  if (named) return path.resolve(named)
+  const base = env.XDG_STATE_HOME || path.join(os.homedir(), ".local", "state")
+  return path.join(base, "magpie-agy-bridge", "agy-home")
+}
+
+// geminiDirArgs gives agy the bridge's own folder when its acp lists
+// --gemini-dir and the folder can be made, else nothing (agy's ~/.gemini).
+// Where no keyring is (a Docker container, a Linux with no D-Bus session),
+// agy keeps its Google sign-in in a file under its folder instead, and a
+// folder of the bridge's own would have no sign-in (plugins#1165): then agy
+// stays on its own, unless AGY_BRIDGE_GEMINI_DIR names one.
+export function fileSignIn(home = os.homedir()) {
+  try {
+    return fs.statSync(path.join(home, ".gemini", "antigravity-cli", "antigravity-oauth-token")).isFile()
+  } catch {
+    return false
+  }
+}
+
+export async function geminiDirArgs(agyPath, env = process.env) {
+  // an account with a home of its own (account.mjs) keeps its sign-in in
+  // a file under that home's .gemini, which agy reads only as its own
+  if (currentHome()) return { args: [], dir: null }
+  const dir = bridgeGeminiDir(env)
+  if (!dir || (!env.AGY_BRIDGE_GEMINI_DIR && fileSignIn())) return { args: [], dir: null }
+  if (!/--gemini[-_]dir\b/.test(await acpHelp(agyPath))) return { args: [], dir: null }
+  try {
+    await fs.promises.mkdir(dir, { recursive: true, mode: 0o700 })
+  } catch {
+    return { args: [], dir: null }
+  }
+  return { args: ["--gemini-dir", dir], dir }
 }
 
 function execOnce(file, args, opts = {}) {
@@ -205,11 +347,19 @@ function execOnce(file, args, opts = {}) {
 }
 
 async function listAgyModels(agyPath) {
+  // a listing nobody asked for doesn't run an agy that would start its own
+  // Google sign-in (signin.mjs); the catalog it has stays
+  if (await backgroundBlocked()) return null
   const { err, stdout, code, timedOut } = await execOnce(agyPath, ["models"], { timeoutMs: 15_000, unrefTimer: true })
   // null, not FALLBACK_MODELS: a failed listing must not overwrite a dynamic catalog.
   if (err || timedOut || code !== 0) return null
+  return parseAgyModels(stdout)
+}
+
+// parseAgyModels reads `agy models` output: one "<id>  <name>" per line.
+function parseAgyModels(stdout) {
   const out = []
-  for (const raw of stdout.split("\n")) {
+  for (const raw of String(stdout ?? "").split("\n")) {
     const line = raw.trim()
     if (!line) continue
     const match = /^(\S+)\s+(.+)$/.exec(line)
@@ -224,12 +374,30 @@ async function listAgyModels(agyPath) {
 
 // probeSignedIn is whether agy lists the signed-in account's models: an
 // exit code alone can't say so, so a listing without one model in it is
-// not signed in either.
+// not signed in either. The listing it read is the catalog's, and what agy
+// acp offers is asked at once (#1064): `agy models` and the session each
+// take seconds on a real agy, and the host lists models right after.
+const OFFERED_SIGNIN_WAIT_MS = 3_000
+
 async function probeSignedIn(agy) {
+  // no sign-in stored, or one agy failed with: `agy models` would start
+  // agy's own Google sign-in (on Windows, a browser no shim stops), so the
+  // caller goes on to magpie's own sign-in link instead
+  const blocked = await backgroundBlocked({ fresh: true })
+  if (blocked) return { ok: false, why: blocked }
   const probe = await execOnce(agy, ["models"], { timeoutMs: 15_000 })
   const listed = !probe.err && !probe.timedOut && probe.code === 0 &&
     probe.stdout.split("\n").some(line => /^\S+\s+\S/.test(line.trim()))
-  if (listed) return { ok: true }
+  if (listed) {
+    const list = parseAgyModels(probe.stdout)
+    if (list) {
+      useAgyPath(agy)
+      storeListedCatalog(agy, list, Date.now())
+      wantOfferedProbe = true
+      await briefly(probeOfferedOnce(agy), OFFERED_SIGNIN_WAIT_MS)
+    }
+    return { ok: true }
+  }
   const why = probe.timedOut
     ? "`agy models` timed out after 15s"
     : `\`agy models\` says: ${(probe.stderr || probe.stdout || "").trim().split(/\r?\n/).filter(Boolean).at(-1) || probe.err?.message || `exit ${probe.code}`}`
@@ -242,6 +410,9 @@ const MODEL_CATALOG_FAST_WAIT_MS = 500
 const MODEL_CATALOG_RETRY_MS = 5_000
 let modelCatalogRefreshPromise = null
 let cachedModelCatalog = fallbackModelCatalog()
+// A caller lists models (provider.models), so a listing that lands asks agy
+// acp what it offers right away, not on the next models() call (#1064).
+let wantOfferedProbe = false
 
 // `agy models` lists every model of the account, while agy's ACP server offers
 // a client only some of them. A session's model option (and its
@@ -269,6 +440,7 @@ function noteOfferedModels(configOptions, models) {
   if (key === acpOfferedKey) return
   acpOfferedModels = names
   acpOfferedKey = key
+  if (cachedModelCatalog?.agyPath) saveCatalog(cachedModelCatalog.agyPath, { offered: [...names].map(([id, name]) => ({ id, name })) })
 }
 
 // A model the session offers that `agy models` did not list is served as is.
@@ -292,6 +464,29 @@ const OFFERED_PROBE_TIMEOUT_MS = 30_000
 const OFFERED_PROBE_RETRY_MS = 60_000
 let offeredProbePromise = null
 let offeredProbeAt = null
+// Bumped when what was learnt about an agy no longer holds (another
+// executable, a new sign-in): a probe still running for the old one is
+// not believed.
+let offeredGen = 0
+
+function forgetOffered() {
+  acpOfferedModels = null
+  acpOfferedKey = ""
+  offeredProbePromise = null
+  offeredProbeAt = null
+  offeredGen++
+}
+
+// briefly waits for a promise at most ms, and never throws.
+async function briefly(promise, ms) {
+  if (!promise) return
+  let timer
+  try {
+    await Promise.race([promise.catch(() => {}), new Promise((resolve) => { timer = setTimeout(resolve, ms) })])
+  } finally {
+    clearTimeout(timer)
+  }
+}
 
 function killQuietly(child) {
   try { child.stdin?.end() } catch {}
@@ -304,6 +499,7 @@ function killQuietly(child) {
 }
 
 async function probeOfferedModels(agyPath) {
+  const gen = offeredGen
   let workspace = null
   let child = null
   let conn = null
@@ -332,7 +528,7 @@ async function probeOfferedModels(agyPath) {
       })
       if (agyTooOld(init?.agentInfo?.version ?? null)) return
       const session = await conn.request("session/new", { cwd: workspace, mcpServers: [] })
-      noteOfferedModels(session?.configOptions, session?.models)
+      if (gen === offeredGen) noteOfferedModels(session?.configOptions, session?.models)
       const caps = init?.agentCapabilities ?? {}
       if (session?.sessionId && (caps.sessionCapabilities?.close ?? caps.session_capabilities?.close)) {
         await conn.request("session/close", { sessionId: session.sessionId }).catch(() => {})
@@ -353,8 +549,11 @@ function probeOfferedOnce(agyPath) {
   const now = Date.now()
   if (offeredProbeAt !== null && now - offeredProbeAt < OFFERED_PROBE_RETRY_MS) return null
   offeredProbeAt = now
-  offeredProbePromise = probeOfferedModels(agyPath).finally(() => { offeredProbePromise = null })
-  return offeredProbePromise
+  const probe = probeOfferedModels(agyPath).finally(() => {
+    if (offeredProbePromise === probe) offeredProbePromise = null
+  })
+  offeredProbePromise = probe
+  return probe
 }
 
 function catalogOf(entry) {
@@ -428,7 +627,121 @@ function buildModelCatalog(list) {
 }
 
 function fallbackModelCatalog(agyPath = null) {
+  // The usage reader names ids on its windows from the catalog being served.
+  storeCatalogRows(FALLBACK_MODELS)
   return { agyPath, list: FALLBACK_MODELS, catalog: null, offeredKey: null, isFallback: true, fetchedAt: 0, lastAttemptAt: null }
+}
+
+// The last list `agy models` gave, kept beside sessions.json per agy
+// executable (#1086): after a restart the host lists it at once, instead of
+// the Gemini-only fallback until agy answers again. It is served as stale
+// (fetchedAt 0), so the first models() call still asks agy.
+const SAVED_CATALOG_MAX_AGE_MS = 14 * 24 * 60 * 60 * 1000
+
+function modelCatalogFile() {
+  return path.join(path.dirname(sessionStateFile()), "models.json")
+}
+
+function validModelRow(row) {
+  return row && typeof row.id === "string" && /^\S+$/.test(row.id) && typeof row.name === "string" &&
+    (row.effort === undefined || EFFORT_ORDER.includes(row.effort))
+}
+
+function readSavedCatalog(agyPath) {
+  if (!agyPath) return null
+  try {
+    const data = JSON.parse(fs.readFileSync(modelCatalogFile(), "utf8"))
+    const entry = data?.version === 1 && data.byAgy && Object.hasOwn(data.byAgy, agyPath) ? data.byAgy[agyPath] : null
+    if (!entry || !Number.isFinite(entry.at) || Date.now() - entry.at > SAVED_CATALOG_MAX_AGE_MS) return null
+    // A half-written or hand-edited file means "unknown": the fallback serves.
+    if (!Array.isArray(entry.list) || !entry.list.length || !entry.list.every(validModelRow)) return null
+    const offered = Array.isArray(entry.offered) && entry.offered.length &&
+      entry.offered.every(row => validModelRow(row) && row.effort === undefined)
+      ? entry.offered
+      : null
+    return { list: entry.list.map(savedRow), offered: offered && offered.map(({ id, name }) => ({ id, name })) }
+  } catch {
+    return null
+  }
+}
+
+function savedRow({ id, name, effort }) {
+  return effort ? { id, name, effort } : { id, name }
+}
+
+// saveCatalog merges what changed (the listing, or what agy acp offers) into
+// the agy's entry.
+function saveCatalog(agyPath, change) {
+  if (!agyPath) return
+  const file = modelCatalogFile()
+  try {
+    withStateLock(file, () => {
+      let byAgy = {}
+      try {
+        const data = JSON.parse(fs.readFileSync(file, "utf8"))
+        if (data?.version === 1 && data.byAgy && typeof data.byAgy === "object") byAgy = data.byAgy
+      } catch {}
+      const entry = { ...(byAgy[agyPath] || {}), at: Date.now() }
+      if (change.list) entry.list = change.list.map(savedRow)
+      if (change.offered) entry.offered = change.offered
+      if (!Array.isArray(entry.list)) return
+      byAgy[agyPath] = entry
+      const temp = `${file}.${process.pid}.${randomUUID().slice(0, 8)}.tmp`
+      fs.writeFileSync(temp, JSON.stringify({ version: 1, byAgy }) + "\n", { mode: 0o600 })
+      fs.renameSync(temp, file)
+    })
+  } catch {}
+}
+
+function startingModelCatalog(agyPath) {
+  const saved = readSavedCatalog(agyPath)
+  if (!saved) return fallbackModelCatalog(agyPath)
+  // What agy acp offered last time, until a session of this run says.
+  if (saved.offered && !acpOfferedModels) {
+    acpOfferedModels = new Map(saved.offered.map(({ id, name }) => [id, name]))
+    acpOfferedKey = [...acpOfferedModels.keys()].sort().join("\n")
+  }
+  // The usage reader names ids on its windows from the catalog being served.
+  storeCatalogRows(saved.list)
+  return { agyPath, list: saved.list, catalog: null, offeredKey: null, isFallback: false, fetchedAt: 0, lastAttemptAt: null }
+}
+
+// useAgyPath starts over when the executable changes: an old executable's
+// dynamic additions and offer must not route to, or list for, a new one.
+function useAgyPath(agyPath) {
+  if (cachedModelCatalog.agyPath === agyPath) return
+  // The first agy this process finds is not a change of one.
+  if (cachedModelCatalog.agyPath !== null) forgetOffered()
+  cachedModelCatalog = startingModelCatalog(agyPath)
+  modelCatalogRefreshPromise = null
+}
+
+function storeListedCatalog(agyPath, list, lastAttemptAt) {
+  saveCatalog(agyPath, { list })
+  // The usage reader names ids on its windows from the catalog being served.
+  storeCatalogRows(list)
+  cachedModelCatalog = {
+    agyPath,
+    list,
+    catalog: null,
+    offeredKey: null,
+    isFallback: false,
+    fetchedAt: Date.now(),
+    lastAttemptAt,
+  }
+}
+
+// catalogWarming is the background work that can still change what models()
+// lists (the listing, then the session probe it starts), or null when there
+// is none. Hosts that read the list once (OpenCode 2.x's adapter) read it
+// again when this ends.
+function catalogWarming() {
+  if (!modelCatalogRefreshPromise && !offeredProbePromise) return null
+  return (async () => {
+    if (modelCatalogRefreshPromise) await modelCatalogRefreshPromise.catch(() => {})
+    if (offeredProbePromise) await offeredProbePromise.catch(() => {})
+    return true
+  })()
 }
 
 // Magpie gives models() about two seconds, while `agy models` can take longer.
@@ -437,11 +750,8 @@ function fallbackModelCatalog(agyPath = null) {
 // probeOffered: the caller is listing models (provider.models), not routing a
 // request that is about to open a session of its own.
 async function loadModelCatalog(agyPath, { probeOffered = false } = {}) {
-  if (cachedModelCatalog.agyPath !== agyPath) {
-    // An old executable's dynamic additions must not route to a new one.
-    cachedModelCatalog = fallbackModelCatalog(agyPath)
-    modelCatalogRefreshPromise = null
-  }
+  useAgyPath(agyPath)
+  if (probeOffered) wantOfferedProbe = true
   const current = cachedModelCatalog
   if (!agyPath) return catalogOf(current)
   const now = Date.now()
@@ -455,15 +765,10 @@ async function loadModelCatalog(agyPath, { probeOffered = false } = {}) {
     current.lastAttemptAt = now
     const refresh = listAgyModels(agyPath).then((list) => {
       if (list?.length && cachedModelCatalog === current) {
-        cachedModelCatalog = {
-          agyPath,
-          list,
-          catalog: null,
-          offeredKey: null,
-          isFallback: false,
-          fetchedAt: Date.now(),
-          lastAttemptAt: current.lastAttemptAt,
-        }
+        storeListedCatalog(agyPath, list, current.lastAttemptAt)
+        // `agy models` answered, so agy is signed in: ask what agy acp
+        // offers now, while the host still waits for its first list.
+        if (wantOfferedProbe) probeOfferedOnce(agyPath)
       }
     }).catch(() => {
       // Keep the last successful catalog, including dynamic-only models.
@@ -485,21 +790,17 @@ async function loadModelCatalog(agyPath, { probeOffered = false } = {}) {
   }
   // `agy models` answered, so agy is signed in: learn what its ACP server
   // offers this client, waiting for it as briefly as for the listing.
-  const probe = probeOffered && !cachedModelCatalog.isFallback ? probeOfferedOnce(agyPath) : null
-  if (probe) {
-    let timer
-    try {
-      await Promise.race([probe, new Promise((resolve) => { timer = setTimeout(resolve, MODEL_CATALOG_FAST_WAIT_MS) })])
-    } finally {
-      clearTimeout(timer)
-    }
-  }
+  // A saved list (fetchedAt 0) is not an answer from this agy yet.
+  const probe = probeOffered && !cachedModelCatalog.isFallback && cachedModelCatalog.fetchedAt > 0 ? probeOfferedOnce(agyPath) : null
+  if (probe) await briefly(probe, MODEL_CATALOG_FAST_WAIT_MS)
   return catalogOf(cachedModelCatalog)
 }
 
 function modelLimits(id) {
   const family = id.replace(/\[1m\]$/i, "").replace(/-(?:minimal|low|medium|high|xhigh|max)$/i, "")
   if (/^(?:gemini-4-argon|gemini-3\.8-flash)$/i.test(family)) return { context: 1048576, output: 65536 }
+  // Gemini 4 Carbon (Ultra plans): the numbers Antigravity's own model list gives it
+  if (/^gemini-4-carbon$/i.test(family)) return { context: 1048576, output: 262144 }
   if (/^claude-(?:opus|sonnet)-5-5$/i.test(family)) return { context: 1000000, output: 64000 }
   if (/^gpt-oss-120b$/i.test(family)) return { context: 131072, output: 32768 }
   return undefined
@@ -650,6 +951,20 @@ class UnsupportedContent extends Error {
 
 // An upstream failure inside a healthy agy session. The process keeps its
 // conversation, so a client retry continues without replaying history.
+// streamErrorOf is the error event a failed turn ends its stream with. A
+// refusal of the request itself (invalid_request_error: a system prompt
+// Antigravity turns away) names its status, 400: magpie's gateway reads a
+// stream error's status from the error's own status field first and from
+// its words after, and this one's words quote Antigravity's "code 429", so
+// without it the client got a 429 and retried a request that can't pass
+// every minute (plugins#1151).
+export function streamErrorOf(error) {
+  const type = error?.kind || "api_error"
+  const out = { type, message: String(error?.message ?? error) }
+  if (type === "invalid_request_error") out.status = 400
+  return out
+}
+
 class AgentTurnError extends Error {
   constructor(message, kind = "api_error") {
     super(message)
@@ -703,6 +1018,15 @@ async function ensureShimDir() {
 const WINDOWS_NC_PREFIX = "magpie-agy-bridge-nc-"
 const WINDOWS_NC_BUILD_PREFIX = "magpie-agy-bridge-ncbuild-"
 const WINDOWS_NC_BUILD_TIMEOUT_MS = 120_000
+// Each nc dir names the runtime that built it, so a build for a newer
+// mcp-server.mjs drops the same runtime's older ones at once: each holds a
+// whole Bun runtime (~115MB), and a week of plugin updates piles them up
+// (#1097). Another runtime's dirs (another install) keep the week.
+const WINDOWS_NC_RUNTIME_FILE = "runtime"
+
+function asciiPath(value) {
+  return /^[\x20-\x7e]*$/.test(String(value || ""))
+}
 
 async function isFileWithBytes(file) {
   try {
@@ -717,6 +1041,8 @@ async function windowsNcDir() {
   if (!windowsNcBuild(process.execPath, MCP_SERVER_PATH, "nc.exe")) return null
   const tmp = os.tmpdir()
   const source = await fs.promises.readFile(MCP_SERVER_PATH)
+  const runtimeKey = createHash("sha256").update(String(process.execPath)).update("\0")
+    .update(String(process.versions?.bun || "")).digest("hex").slice(0, 16)
   const key = createHash("sha256").update(String(process.execPath)).update("\0")
     .update(String(process.versions?.bun || "")).update("\0").update(source).digest("hex").slice(0, 16)
   const dir = path.join(tmp, WINDOWS_NC_PREFIX + key)
@@ -727,11 +1053,28 @@ async function windowsNcDir() {
     return dir
   }
   const build = await fs.promises.mkdtemp(path.join(tmp, WINDOWS_NC_BUILD_PREFIX))
+  let copy = null
+  let copyBase = null
   try {
-    const spec = windowsNcBuild(process.execPath, MCP_SERVER_PATH, path.join(build, "nc.exe"))
+    let runtime = process.execPath
+    if (!asciiPath(runtime)) {
+      // Bun's compile reads its own path one byte to one UTF-16 unit, so a
+      // runtime under a non-ASCII folder (a Chinese user name) fails with
+      // "failed to copy bun executable into temporary file: ENOENT" (#1097).
+      // A copy of it in an ASCII-only folder builds the same nc.exe.
+      const base = [tmp, process.env.PUBLIC, process.env.ProgramData]
+        .find(dir => dir && asciiPath(dir))
+      if (!base) return null
+      copyBase = base
+      copy = base === tmp ? build : await fs.promises.mkdtemp(path.join(base, WINDOWS_NC_BUILD_PREFIX))
+      runtime = path.join(copy, path.win32.basename(process.execPath))
+      await fs.promises.copyFile(process.execPath, runtime)
+    }
+    const spec = windowsNcBuild(runtime, MCP_SERVER_PATH, path.join(build, "nc.exe"))
     const { err, code, timedOut } = await execOnce(spec.file, spec.args, { cwd: build, timeoutMs: WINDOWS_NC_BUILD_TIMEOUT_MS })
     if (err || timedOut || code !== 0 || !await isFileWithBytes(path.join(build, "nc.exe"))) return null
     await fs.promises.mkdir(dir, { recursive: true })
+    await fs.promises.writeFile(path.join(dir, WINDOWS_NC_RUNTIME_FILE), runtimeKey).catch(() => {})
     try {
       await fs.promises.rename(path.join(build, "nc.exe"), exe)
     } catch (error) {
@@ -740,15 +1083,18 @@ async function windowsNcDir() {
     }
   } finally {
     fs.promises.rm(build, { recursive: true, force: true }).catch(() => {})
+    if (copy && copy !== build) fs.promises.rm(copy, { recursive: true, force: true }).catch(() => {})
   }
-  sweepWindowsNcDirs(tmp, path.basename(dir)).catch(() => {})
+  sweepWindowsNcDirs(tmp, path.basename(dir), runtimeKey).catch(() => {})
+  if (copyBase && copyBase !== tmp) sweepWindowsNcDirs(copyBase, path.basename(dir), runtimeKey).catch(() => {})
   return dir
 }
 
-// A build no host has started for a week (an older runtime or server), or a
-// build dir a killed host left half done. An nc.exe still running is locked,
-// so its dir stays until a later sweep.
-async function sweepWindowsNcDirs(tmp, keep) {
+// A build no host has started for a week (an older runtime or server), one
+// this runtime built for an older server, or a build dir a killed host left
+// half done. An nc.exe still running is locked, so its dir stays until a
+// later sweep.
+async function sweepWindowsNcDirs(tmp, keep, runtimeKey = "") {
   const now = Date.now()
   for (const name of await fs.promises.readdir(tmp)) {
     const shared = name.startsWith(WINDOWS_NC_PREFIX) && /^[0-9a-f]{16}$/.test(name.slice(WINDOWS_NC_PREFIX.length))
@@ -756,11 +1102,29 @@ async function sweepWindowsNcDirs(tmp, keep) {
     if (name === keep || (!shared && !build)) continue
     const file = path.join(tmp, name)
     try {
+      const ours = shared && runtimeKey &&
+        await fs.promises.readFile(path.join(file, WINDOWS_NC_RUNTIME_FILE), "utf8").then(v => v === runtimeKey, () => false)
       const stat = await fs.promises.stat(shared ? path.join(file, "nc.exe") : file).catch(() => fs.promises.stat(file))
-      if (now - stat.mtimeMs < (shared ? 7 * 24 : 1) * 60 * 60 * 1000) continue
+      if (!ours && now - stat.mtimeMs < (shared ? 7 * 24 : 1) * 60 * 60 * 1000) continue
       await fs.promises.rm(file, { recursive: true, force: true })
     } catch {}
   }
+}
+
+// The client tool a permission request names, when it names one on the
+// bridge's ide-tools server: agy calls it `mcp(ide-tools/<name>)` in its
+// permission rules and `mcp_ide-tools_<name>` as a function. Only agy's own
+// words are read (title, name), never rawInput, which the model writes.
+const IDE_TOOL_NAMED = /^(?:mcp\(ide-tools\/([^()\s]+)\)|(?:mcp\s+)?"?ide-tools\/([^()\s"]+)"?|mcp_ide-tools_(\S+))$/
+export function ideToolOf(toolCall) {
+  for (const value of [toolCall?.title, toolCall?.name, toolCall?.toolName]) {
+    if (typeof value !== "string") continue
+    // The whole title, never a word in it: a shell command's own text can
+    // appear in its title.
+    const m = IDE_TOOL_NAMED.exec(value.trim().replace(/\?$/, ""))
+    if (m) return m[1] || m[2] || m[3]
+  }
+  return ""
 }
 
 function agentDefinition() {
@@ -907,8 +1271,18 @@ class Turn {
     this.done = false
     this.finalized = false
     this.cancelRequested = false
+    this.steering = false
+    this.promptInFlight = false
+    this.activeAcpToolCalls = new Set()
+    this.acpToolWaiters = []
+    this.cancelledMcpSockets = new Set()
     this.agentError = false
     this.heldText = ""
+    this.textTail = ""
+    this.openBanner = -1
+    this.attemptDetail = ""
+    this.refusedDetail = ""
+    this.agentErrorCore = ""
     this.timer = null
     this.cleanupTimer = null
     this.logOffset = 0
@@ -928,13 +1302,23 @@ class Turn {
     this.rawAcpUsages = []
     this.rawUsage = null
     this.accountedPrompts = new Set()
+    this.stepUsageReconciled = false
+    this.sawGenerationOutput = false
     let settle
     this.settled = new Promise((resolve) => { settle = resolve })
     this.settle = settle
   }
 
   registerResponse(body) {
-    const estimate = estimateInputTokens(body)
+    // Only the current step's body is read again (a late prompt's estimate).
+    // An earlier one is dropped here: a tool loop sending screenshots kept
+    // every request's parsed body, 20MB+ each, for the whole turn (plugins#1137).
+    const previous = this.currentResponse
+    if (previous) {
+      previous.body = null
+      previous.contentSnapshot = null
+    }
+    const estimate = this.proc.estimatePromptTokens(body)
     const pending = this.pendingPromptStep
     const step = {
       body,
@@ -967,7 +1351,7 @@ class Turn {
       const results = extractToolResults(body)
       const alreadyInHistory = lateCalls?.length && lateCalls.every((call) =>
         results.some((block) => block.tool_use_id === call.id))
-      const estimate = estimateInputTokens({
+      const estimate = this.proc.estimatePromptTokens({
         ...body,
         messages: [
           ...history,
@@ -1005,8 +1389,8 @@ class Turn {
       // no usage of their own until it ends, so they take this ratio. Only a
       // final, uncancelled response used to teach it, so a fresh or cancelled
       // conversation reported every tool step as a full cache miss.
-      const ratio = cacheReadRatio(usage)
-      if (Number.isFinite(ratio)) this.proc.lastCacheRatio = ratio
+      const parts = promptUsage(usage)
+      if (parts.promptInput > 0) this.proc.lastCacheRatio = Math.min(1, parts.read / parts.promptInput)
     }
     return this.rawUsage
   }
@@ -1020,12 +1404,12 @@ class Turn {
     }
     this.emittedOutputTokens = tokenCount(this.emittedOutputTokens + usage.output_tokens)
     if (!final) this.toolResponseCount++
-    if (!["exact_model_step", "exact_single_prompt"].includes(step.usageKind)) return
-    const window = usage.input_tokens + usage.cache_read_input_tokens + usage.cache_creation_input_tokens
+    const total = usage.input_tokens + usage.cache_read_input_tokens + usage.cache_creation_input_tokens
     const estimate = this.stepInputEstimates[step.estimateIndex] || step.inputEstimate
-    if (estimate > 0 && window > 0) this.proc.inputTokenScale = Math.max(0.5, Math.min(1.5, window / estimate))
-    const readWindow = usage.input_tokens + usage.cache_read_input_tokens
-    if (readWindow > 0) this.proc.lastCacheRatio = usage.cache_read_input_tokens / readWindow
+    if (calibrate && total > 0) {
+      this.proc.inputTokenScale = Math.max(0.5, Math.min(1.5, total / estimate))
+      this.proc.lastCacheRatio = Math.max(0, Math.min(1, usage.cache_read_input_tokens / total))
+    }
   }
 
   attach() {
@@ -1078,39 +1462,111 @@ class Turn {
     })
   }
 
-  // Withholds a possible prefix of agy's error marker until it can be classified.
+  // Withholds agy's error marker, or a possible prefix of it, until it can be
+  // classified. agy's own marker ends the prompt; one that more text follows
+  // was the model quoting it (#1052). agy's retry banners are dropped where
+  // they start a line (#1124, #1136); one whose line hasn't ended is held.
   pushText(chunk) {
     if (this.done || this.agentError) return
-    let text = this.heldText + chunk
+    this.pushHeld(chunk)
+    if (this.refusedDetail && !this.done) {
+      this.heldText = ""
+      this.proc.refuseTurn(this, this.refusedDetail)
+    }
+  }
+
+  pushHeld(chunk) {
+    let text = this.dropRetryBanner(this.heldText + chunk)
     this.heldText = ""
-    const marker = text.indexOf(AGENT_ERROR_CORE)
-    if (marker >= 0) {
-      this.agentError = true
-      text = text.slice(0, marker).replace(/\n$/, "")
-      if (text) this.push({ type: "text", text })
+    if (this.openBanner >= 0) {
+      this.heldText = text.slice(this.openBanner)
+      this.emitText(text.slice(0, this.openBanner))
       return
     }
-    for (let keep = Math.min(text.length, AGENT_ERROR_MARKER.length - 1); keep > 0; keep--) {
-      if (AGENT_ERROR_MARKER.startsWith(text.slice(-keep))) {
-        this.heldText = text.slice(-keep)
+    for (const core of AGENT_ERROR_CORES) {
+      const marker = text.lastIndexOf(core)
+      if (marker >= 0 && !text.slice(marker + core.length).trim()) {
+        const start = text[marker - 1] === "\n" ? marker - 1 : marker
+        this.heldText = text.slice(start)
+        this.emitText(text.slice(0, start))
+        return
+      }
+    }
+    for (let keep = Math.min(text.length, HOLD_MAX); keep > 0; keep--) {
+      const tail = text.slice(-keep)
+      if (AGENT_ERROR_MARKERS.some((marker) => marker.startsWith(tail)) ||
+        (keep > 1 && (RETRY_MARKER.startsWith(tail) || ATTEMPT_MARKER.startsWith(tail)))) {
+        this.heldText = tail
         text = text.slice(0, -keep)
         break
       }
     }
-    if (text) this.push({ type: "text", text })
+    this.emitText(text)
+  }
+
+  // Removes agy's retry banners, each with its leading and one trailing
+  // newline, wherever one starts a line. Text that only quotes one mid-line is
+  // kept. Until the turn's text is flushed, a banner that ends the buffer is
+  // left in place and openBanner says where, so pushText holds it and its
+  // newline in the next chunk goes with it.
+  dropRetryBanner(text, final = false) {
+    this.openBanner = -1
+    let from = 0
+    for (;;) {
+      const at = nextBanner(text, from)
+      if (at < 0) return text
+      const lineStart = at > 0 ? text[at - 1] === "\n" : this.textTail === "" || this.textTail === "\n"
+      if (!lineStart) {
+        from = at + 1
+        continue
+      }
+      const start = at > 0 ? at - 1 : at
+      const attempt = !text.startsWith(RETRY_CORE, at)
+      let end = attempt ? text.indexOf("\n", at) : at + RETRY_CORE.length
+      if (end < 0) end = text.length
+      if (end === text.length && !final) {
+        // agy waits before its next try with the line still open
+        const open = attempt ? ATTEMPT_LINE.exec(text.slice(at, end))?.[1]?.trim() : ""
+        if (open && refused429(open)) this.refusedDetail ||= open
+        this.openBanner = start
+        return text
+      }
+      if (attempt) this.attemptDetail = ATTEMPT_LINE.exec(text.slice(at, end))?.[1]?.trim() || this.attemptDetail
+      if (attempt && refused429(this.attemptDetail)) this.refusedDetail ||= this.attemptDetail
+      if (text[end] === "\n") end++
+      text = text.slice(0, start) + text.slice(end)
+      from = start
+    }
+  }
+
+  emitText(text) {
+    if (!text) return
+    this.textTail = text.slice(-1)
+    this.push({ type: "text", text })
+  }
+
+  // The prompt ended: a marker still held was agy's own.
+  endText() {
+    const core = AGENT_ERROR_CORES.find((core) => this.heldText.includes(core))
+    if (core) {
+      this.agentError = true
+      this.agentErrorCore = core
+      this.heldText = ""
+    }
   }
 
   flushText() {
     if (!this.heldText || this.agentError) return
-    const text = this.heldText
+    const text = this.dropRetryBanner(this.heldText, true)
     this.heldText = ""
-    this.push({ type: "text", text })
+    this.emitText(text)
   }
 
   complete(result) {
     if (this.done) return
     this.done = true
     clearTimeout(this.timer)
+    this.notifyAcpTools()
     this.push({ type: "result", result })
   }
 
@@ -1118,6 +1574,7 @@ class Turn {
     if (this.done || this.finalized) return
     this.done = true
     clearTimeout(this.timer)
+    this.notifyAcpTools()
     for (const waiter of this.lateWaiters.splice(0)) waiter.reject(error)
     this.push({ type: "error", error })
     clearTimeout(this.cleanupTimer)
@@ -1125,6 +1582,78 @@ class Turn {
       this.proc.abandonTurn(this)
     }, IDLE_MS)
     this.cleanupTimer.unref()
+  }
+
+  noteAcpToolUpdate(update) {
+    const type = update?.sessionUpdate
+    const id = update?.toolCallId
+    if (!id) return
+    if (type === "tool_call") {
+      if (!update.status || update.status === "in_progress" || update.status === "pending") {
+        this.activeAcpToolCalls.add(id)
+      } else {
+        this.activeAcpToolCalls.delete(id)
+      }
+      this.notifyAcpTools()
+      return
+    }
+    if (type === "tool_call_update" && update.status &&
+      update.status !== "in_progress" && update.status !== "pending") {
+      this.activeAcpToolCalls.delete(id)
+      this.notifyAcpTools()
+    }
+  }
+
+  notifyAcpTools() {
+    for (const check of [...this.acpToolWaiters]) check()
+  }
+
+  // Waits until agy finishes recording the MCP responses for `pendingIds`
+  // (emits tool_call_update, moves on to generation, or closes the turn) so a
+  // follow-up session/cancel does not abort an in-flight MCP tool execution.
+  waitAcpToolsCommitted(pendingIds, timeoutMs) {
+    const remaining = () => {
+      if (this.done || this.finalized || this.sawGenerationOutput) return false
+      for (const id of pendingIds) {
+        if (this.activeAcpToolCalls.has(id)) return true
+      }
+      return false
+    }
+    if (!remaining()) return Promise.resolve(true)
+    return new Promise((resolve) => {
+      let settled = false
+      const finish = (ok) => {
+        if (settled) return
+        settled = true
+        clearTimeout(timer)
+        const idx = this.acpToolWaiters.indexOf(check)
+        if (idx >= 0) this.acpToolWaiters.splice(idx, 1)
+        resolve(ok)
+      }
+      const check = () => {
+        if (!remaining()) finish(true)
+      }
+      const timer = setTimeout(() => finish(!remaining()), timeoutMs)
+      timer.unref?.()
+      this.acpToolWaiters.push(check)
+    })
+  }
+
+  // Preserves SQLite step-usage tracking across a steered tool turn when the
+  // cancelled prompt ended cleanly after its already-measured tool step(s),
+  // with no unconsumed or pending generation row left in the store.
+  reconcileCancelledStepUsage(rawUsage) {
+    if (this.stepUsageReconciled || this.sawGenerationOutput || !this.stepsFile || this.stepCursor == null) return
+    const measuredPrompt = this.measured?.prompt ?? 0
+    if (measuredPrompt <= 0 || !rawUsage || typeof rawUsage !== "object") return
+    const acp = promptUsage(rawUsage)
+    const expected = acp.promptInput + acp.write
+    if (expected <= 0) return
+    if (Math.abs(measuredPrompt - expected) > Math.max(16, Math.ceil(expected * 0.01))) return
+    const tail = modelUsageAfter(this.stepsFile, this.stepCursor)
+    if (tail && !tail.pending && tail.steps.length === 0) {
+      this.stepUsageReconciled = true
+    }
   }
 
   // True while the client still owes a result, including calls agy stopped waiting for.
@@ -1191,6 +1720,8 @@ class Proc {
     // Unset until recordPromptUsage or a final calibrated response teaches
     // it, including a recorded 0. Distinct from a calibrated miss.
     this.lastCacheRatio = undefined
+    this.omittedHistoryTokens = 0
+    this.stepUsageTrusted = true
     this.configOptions = []
     this.configMethodUnsupported = false
     this.currentSelectionKey = null
@@ -1237,6 +1768,15 @@ class Proc {
       "--ide-mcp-port", String(controlServer.address().port),
     ]
     if (this.workDir) args.push("--add-dir", this.workDir)
+    args.push(...await noDefaultCustomizationsArgs(this.agyPath))
+    const own = await geminiDirArgs(this.agyPath)
+    args.push(...own.args)
+    // agy writes the conversation's steps under the folder it was given
+    const home = currentHome()
+    this.conversationsDir = process.env.AGY_BRIDGE_CONVERSATIONS_DIR ? null
+      : own.dir ? path.join(own.dir, "antigravity-cli", "conversations")
+        : home ? path.join(home, ".gemini", "antigravity-cli", "conversations")
+          : null
     try {
       const childEnv = { ...process.env }
       const inheritedPath = process.env.PATH || childEnv.Path || ""
@@ -1316,9 +1856,9 @@ class Proc {
       capabilities.prompt_capabilities?.image === true
     const appendable = capabilities._meta?.antigravity?.systemPrompt?.append === true
     const resumable = !!(capabilities.sessionCapabilities?.resume ?? capabilities.session_capabilities?.resume)
-    this.instructionsInSession = appendable && !!this.instructions
+    this.instructionsInSession = appendable && systemAppend() && !!this.instructions
     const meta = this.instructionsInSession
-      ? { _meta: { antigravity: { systemPrompt: { append: cloak(this.instructions) } } } }
+      ? { _meta: { antigravity: { systemPrompt: { append: outgoing(this.instructions) } } } }
       : {}
 
     let session = null
@@ -1423,7 +1963,16 @@ class Proc {
     // the server marks it always loaded; tools with larger schemas were left out
     // and the model could not reach them (#989). Every client-declared tool is
     // one the client means the model to see.
-    return this.tools.map((tool) => ({ ...tool, _meta: { ...tool._meta, [ALWAYS_LOAD]: true } }))
+    //
+    // agy holds them all in a 20,000-token budget and drops whole tools,
+    // the largest first, past it; fitTools shortens their descriptions
+    // instead, so every tool stays (plugins#1140). The trimmed list is kept
+    // per catalog: agy asks again on every tools/list_changed.
+    if (this.fittedFor !== this.toolsSignature) {
+      this.fitted = fitTools(this.tools.map((tool) => ({ ...tool, _meta: { ...tool._meta, [ALWAYS_LOAD]: true } })))
+      this.fittedFor = this.toolsSignature
+    }
+    return this.fitted
   }
 
   addWatcher(socket) {
@@ -1462,8 +2011,17 @@ class Proc {
       throw Object.assign(new Error("unknown session"), { code: -32602 })
     }
     if (method === "session/request_permission") {
-      // Client tools arrive through MCP and never ask. Deny anything that would
-      // run inside agy itself (shell, file edits, questions, browser).
+      // A client tool reaches agy through the bridge's own ide-tools MCP
+      // server and runs in the client, under the client's own permissions.
+      // Newer agy asks before an MCP call too (plugins #1082), so a request
+      // that names ide-tools and a tool the client declared is allowed once.
+      // Anything that would run inside agy itself (shell, file edits,
+      // questions, browser) is denied.
+      const tool = ideToolOf(params?.toolCall)
+      if (tool && this.tools.some((t) => t.name === tool)) {
+        const allow = (params?.options || []).find((option) => option?.kind === "allow_once")
+        if (allow) return { outcome: { outcome: "selected", optionId: allow.optionId } }
+      }
       this.deniedPermissions++
       const reject = (params?.options || []).find((option) => option?.kind === "reject_once")
         || (params?.options || []).find((option) => option?.kind === "reject_always")
@@ -1486,14 +2044,33 @@ class Proc {
     if (!turn || turn.done || turn.finalized) return
     const update = params.update ?? {}
     turn.arm()
+    turn.noteAcpToolUpdate(update)
     if (turn.cancelRequested) return
     if (update.sessionUpdate === "agent_message_chunk") {
       const text = update.content?.type === "text" ? update.content.text : ""
-      if (text) turn.pushText(text)
+      if (text) {
+        turn.sawGenerationOutput = true
+        if (turn.steering) {
+          turn.notifyAcpTools()
+          return
+        }
+        turn.pushText(text)
+      }
     } else if (update.sessionUpdate === "agent_thought_chunk") {
       const text = update.content?.type === "text" ? update.content.text : ""
-      if (text) turn.push({ type: "thinking", text })
+      if (text) {
+        turn.sawGenerationOutput = true
+        if (turn.steering) {
+          turn.notifyAcpTools()
+          return
+        }
+        turn.push({ type: "thinking", text })
+      }
     }
+  }
+
+  estimatePromptTokens(body) {
+    return Math.max(1, estimateInputTokens(body) - this.omittedHistoryTokens)
   }
 
   startTurn(content, messages, model, selection) {
@@ -1504,6 +2081,7 @@ class Proc {
       throw new UnsupportedContent("image input with this agy ACP server; update to an image-capable agy version")
     }
     const turn = new Turn(this, messages)
+    turn.model = model
     this.turn = turn
     this.expectedMessages = messages.map((message) => ({ ...message }))
     this.historyInvalid = false
@@ -1553,22 +2131,37 @@ class Proc {
     return historyKey(stripToolUseInputs(expectedAssistant)) === historyKey(stripToolUseInputs(actualAssistant))
   }
 
-  // Answers the pending calls with the results the client sent, cancels what
-  // agy was doing next, and leaves the session at `history`, ready for the
-  // steer's prompt. False when anything is off; the caller then replays in a
-  // new session, as before.
+  // Answers the pending calls with the results the client sent, waits for agy
+  // to commit those MCP responses before cancelling what it would do next, and
+  // leaves the session at `history`, ready for the steer's prompt. False when
+  // anything is off; the caller then replays in a new session, as before.
   async steerInSession(turn, results, history) {
-    if (this.dead || this.stopping || this.retiring || this.turn !== turn || turn.done || turn.finalized ||
-      !Array.isArray(history)) return false
-    // An image in a result is replayed in the prompt, as before.
-    if (results.some((item) => item.result.content.some((part) => part.type !== "text"))) return false
+    if (this.dead || this.stopping || this.retiring || this.turn !== turn || turn.steering || turn.done ||
+      turn.finalized || !Array.isArray(history)) return false
+    // agy offloads an image in an MCP result to a file the model can't open,
+    // so the call is answered with its text and the image goes in the
+    // steer's prompt (withoutAnswered keeps it there).
+    results = results.map((item) => ({ ...item, result: textOnlyResult(item.result) }))
+    const deliveringLiveMcp = results.some(({ call }) =>
+      (!call.deferred && !call.mcpResponded && call.ready && !turn.done) ||
+      (call.deferred && !call.result && turn.awaitCalls.some((waiter) => waiter.target === call)))
+    // ACP toolCallIds come from agy's session/update notifications and are
+    // distinct from the bridge's toolu_ IDs, so snapshot all in-flight ACP IDs.
+    const pendingAcpIds = deliveringLiveMcp ? new Set(turn.activeAcpToolCalls) : new Set()
+    turn.steering = true
     try {
       this.continueWith(results)
     } catch {
+      turn.steering = false
       return false
     }
-    if (!this.cancelTurn(turn, [])) return false
+    if (pendingAcpIds.size && !(await turn.waitAcpToolsCommitted(pendingAcpIds, mcpCommitWaitMs()))) {
+      return false
+    }
+    if (this.dead || this.stopping || this.retiring) return false
+    if (!turn.done && !turn.finalized && !this.cancelTurn(turn, [])) return false
     await Promise.race([turn.settled, new Promise((resolve) => setTimeout(resolve, CANCEL_SETTLE_MS))])
+    if (turn.done && !turn.finalized) this.finalizeTurn(turn)
     if (!turn.finalized || this.dead || this.stopping || this.historyInvalid || this.turn) return false
     this.expectedMessages = history.map((message) => ({ ...message }))
     return true
@@ -1586,12 +2179,17 @@ class Proc {
 
   async #runTurn(turn, content, model, selection) {
     try {
-      // Cancelled/aborted generations may have finished accounting after the
-      // client detached. Preserve their ledger without charging the next turn.
       const unreturned = await this.transcriptUsage?.read()
       if (unreturned) logBridgeEvent(this, turn, "unreturned_model_usage", "previous_turn_finished_after_detach", {}, { usage: unreturned.usage, model_steps: unreturned.steps })
       turn.arm()
       if (model) await this.#setModel(model, selection)
+      const stepUsageEnabled = !this.transcriptUsage && this.stepUsageTrusted &&
+        !/^(?:0|false|off|no|disabled)$/i.test(process.env.AGY_BRIDGE_STEP_USAGE || "")
+      turn.stepsFile = stepUsageEnabled
+        ? sessionDbPath(this.sessionId, this.conversationsDir ? { AGY_BRIDGE_CONVERSATIONS_DIR: this.conversationsDir } : process.env)
+        : null
+      turn.stepCursor = turn.stepsFile ? modelUsageCursor(turn.stepsFile) : null
+      if (turn.stepsFile && turn.stepCursor === null) this.stepUsageTrusted = false
       // Content a cancelled turn never delivered still belongs to the session.
       let promptParts = mergePromptParts(this.unsentPrompt, toPromptParts(content))
       this.unsentPrompt = null
@@ -1608,16 +2206,27 @@ class Proc {
         turn.arm()
         unpark(this.convKey)
         this.hasSentFirstTurn = true
+        // agy hands Antigravity the prompt as a user's turn, where Codex's
+        // GPT-5 lines are turned away too (cloak.mjs, USER_TURNED_AWAY)
+        promptParts = userTurnParts(promptParts)
         const promptNumber = turn.beginPrompt(promptParts, lateCalls)
-        const result = await this.conn.request("session/prompt", {
-          sessionId: this.sessionId,
-          prompt: promptParts.length ? promptParts : [{ type: "text", text: "" }],
-        })
+        turn.promptInFlight = true
+        let result
+        try {
+          result = await this.conn.request("session/prompt", {
+            sessionId: this.sessionId,
+            prompt: promptParts.length ? promptParts : [{ type: "text", text: "" }],
+          })
+        } finally {
+          turn.promptInFlight = false
+        }
         usage = turn.recordPromptUsage(promptNumber, result?.usage)
         if (turn.cancelRequested) {
+          turn.reconcileCancelledStepUsage(usage)
           turn.complete({ stopReason: "cancelled" })
           return
         }
+        turn.endText()
         if (turn.agentError) {
           throw await this.#agentError(turn)
         }
@@ -1662,7 +2271,14 @@ class Proc {
   }
 
   async #agentError(turn) {
-    const detail = await lastAgentError(this.logPath, turn.logOffset)
+    const core = turn.agentErrorCore
+    // A failed connection is in the reply's last attempt line, not the log's
+    // executor error (#1136).
+    const detail = await lastAgentError(this.logPath, turn.logOffset) || turn.attemptDetail ||
+      (core && core !== AGENT_ERROR_CORES[0] ? core.replace(/^⚠ /, "") : "")
+    if (core === CREDITS_CORE) {
+      return new AgentTurnError(`agy bridge: Antigravity AI credits balance is too low to continue${detail ? ": " + detail : ""}`, "rate_limit_error")
+    }
     return this.#formatAgentError(detail)
   }
 
@@ -1678,7 +2294,7 @@ class Proc {
     }
     if (/QUOTA_EXHAUSTED|RESOURCE_EXHAUSTED|MODEL_CAPACITY_EXHAUSTED|code 429\b/i.test(detail)) {
       return new AgentTurnError(
-        `agy bridge: Antigravity quota or rate limit reached${detail ? ": " + detail : ""}`,
+        `agy bridge: Antigravity quota or rate limit reached${detail ? ": " + detail : ""}${refused429(detail) ? " — Antigravity answers this same bare 429 to a system prompt it turns away whatever quota is left, so if quota is left it is not a quota and waiting won't help: something in this agent's system prompt is being matched" : ""}`,
         "rate_limit_error",
       )
     }
@@ -1707,6 +2323,16 @@ class Proc {
     return true
   }
 
+  // A try Antigravity answered with the bare 429 ends the turn now, with the
+  // same error as agy's own 429 ending, instead of after agy's retries: the
+  // process goes, as on a timeout, since agy is still retrying in it.
+  refuseTurn(turn, detail) {
+    if (this.turn !== turn || turn.done) return
+    turn.fail(this.#formatAgentError(detail))
+    dropFromPool(this)
+    this.stop().catch(() => {})
+  }
+
   timeoutTurn(turn, error) {
     if (this.turn !== turn || turn.done) return
     turn.fail(error)
@@ -1716,13 +2342,28 @@ class Proc {
 
   acceptMcpCall(message, socket) {
     const turn = this.turn
-    if (!turn || turn.done || turn.finalized || turn.cancelRequested) {
+    if (!turn || turn.done || turn.finalized) {
       throw new Error("agy bridge: no active turn for MCP call")
     }
+    if (turn.cancelRequested || turn.steering) {
+      // Hold any trailing sibling MCP call quiet while session/cancel is on its
+      // way so agy aborts it via cancellation instead of advancing to a new step.
+      turn.cancelledMcpSockets.add(socket)
+      socket.once("close", () => turn.cancelledMcpSockets.delete(socket))
+      return null
+    }
+    if (!turn.promptInFlight) {
+      throw new Error("agy bridge: no prompt in flight for MCP call")
+    }
     const name = message.name
-    const args = message.arguments ?? {}
+    let args = message.arguments ?? {}
     if (!args || typeof args !== "object" || Array.isArray(args)) throw new Error("agy bridge: invalid tool arguments")
-    if (!this.tools.some((tool) => tool.name === name)) throw new Error(`agy bridge: undeclared tool ${name}`)
+    const tool = this.tools.find((item) => item.name === name)
+    if (!tool) throw new Error(`agy bridge: undeclared tool ${name}`)
+    // agy consumes its internal toolSummary instead of forwarding it to MCP.
+    if (name === "run_command" && tool.inputSchema?.properties?.toolSummary && !Object.hasOwn(args, "toolSummary")) {
+      args = { ...args, toolSummary: "Run command" }
+    }
     const signature = stableJSON(args)
     const running = turn.calls.find((call) => call.deferred && !call.lateDelivered &&
       call.name === name && stableJSON(call.arguments) === signature)
@@ -1869,6 +2510,15 @@ class Proc {
   finalizeTurn(turn) {
     if (turn.finalized) return
     turn.finalized = true
+    turn.notifyAcpTools()
+    for (const socket of turn.cancelledMcpSockets) {
+      try { socket.destroy() } catch {}
+    }
+    turn.cancelledMcpSockets.clear()
+    turn.steering = false
+    if (turn.stepsFile && turn.promptCount > 0 && !turn.stepUsageReconciled) {
+      this.stepUsageTrusted = false
+    }
     turn.detach()
     clearTimeout(turn.timer)
     for (const waiter of turn.waiters.splice(0)) {
@@ -1985,6 +2635,22 @@ function resultText(result) {
   return (result?.content || []).map((part) => part?.type === "text" ? part.text : "[image returned by tool]").join("\n\n")
 }
 
+export const IMAGE_FOLLOWS = "[The image this tool returned is attached to the next message.]"
+
+function resultHasImage(result) {
+  return (result?.content || []).some((part) => part?.type === "image")
+}
+
+// A tool result as agy gets it over MCP: agy writes an MCP image to a file
+// ("[Resource offloaded to file://…/media_0.jpg]") and the model never sees
+// it, so each image is left out with a line saying where it went.
+function textOnlyResult(result) {
+  if (!resultHasImage(result)) return result
+  const content = result.content.filter((part) => part?.type !== "image")
+  content.push({ type: "text", text: IMAGE_FOLLOWS })
+  return { ...result, content }
+}
+
 function renderLateResults(calls) {
   const parts = ["Client tool calls that were still running have finished. Their real results:"]
   for (const call of calls) {
@@ -2023,6 +2689,13 @@ function toPromptParts(content) {
     }
   }
   return out
+}
+
+// userTurnParts is parts with each text part as cloakUser says
+function userTurnParts(parts) {
+  return parts.map((part) => part?.type === "text" && typeof part.text === "string"
+    ? { ...part, text: cloakUser(part.text) }
+    : part)
 }
 
 function mergePromptParts(first, second) {
@@ -2069,13 +2742,23 @@ async function lastAgentError(file, offset) {
   }
   let found = ""
   for (const line of text.split("\n")) {
-    const match = /\] (?:agent executor error|failed to construct executor): (.+)$/.exec(line)
+    const match = /\] (?:agent executor error|failed to construct executor|inference connection failed[^:]*): (.+)$/.exec(line) ||
+      /\] (?:Run|CallWithRetry): attempt \d+ failed \((.+)\), retrying in /.exec(line)
     if (match) found = match[1]
   }
   if (!found) return ""
   const cut = found.lastIndexOf("generating and executing: ")
   if (cut >= 0) found = found.slice(cut + "generating and executing: ".length)
   return found.trim().slice(0, 1000)
+}
+
+// Where the next retry banner of either kind starts, from `from` on.
+function nextBanner(text, from) {
+  const retry = text.indexOf(RETRY_CORE, from)
+  const attempt = text.indexOf(ATTEMPT_CORE, from)
+  if (retry < 0) return attempt
+  if (attempt < 0) return retry
+  return Math.min(retry, attempt)
 }
 
 function dropFromPool(proc) {
@@ -2200,7 +2883,9 @@ function park(proc) {
     historyHash: digest(historyKey(proc.expectedMessages)),
     historyHashSansInputs: digest(historyKey(stripToolUseInputs(proc.expectedMessages))),
     toolUseIdentitiesHash: digest(toolUseIdentitiesKey(proc.expectedMessages) ?? ""),
-    instructionsHash: digest(instructionsIdentity(proc.instructions)),
+    instructionsHash: digest(sentInstructionsIdentity(proc.instructions)),
+    userCloak: USER_CLOAK,
+    instructionsInSession: !!proc.instructionsInSession,
     workDir: proc.workDir,
     at: Date.now(),
   })
@@ -2216,7 +2901,8 @@ function takeParked(convKey, opts) {
   unparked.add(convKey)
   saveParked()
   if (Date.now() - entry.at > RESUME_TTL_MS || (entry.workDir ?? null) !== (opts.workDir ?? null) ||
-    entry.instructionsHash !== digest(instructionsIdentity(opts.instructions))) return null
+    entry.instructionsHash !== digest(sentInstructionsIdentity(opts.instructions)) ||
+    entry.userCloak !== USER_CLOAK || entry.instructionsInSession !== (systemAppend() && !!opts.instructions)) return null
   const incoming = digest(historyKey(opts.history))
   if (entry.historyHash === incoming) return { sessionId: entry.sessionId, expectedMessages: opts.history }
   // Sans-inputs resume needs the hashes written by current park(). Old
@@ -2277,7 +2963,7 @@ async function evictLRU() {
   let victim = null
   for (const proc of pool.values()) {
     const turn = proc.turn
-    if (proc.retiring || !turn || turn.attached || turn.cancelRequested) continue
+    if (proc.retiring || !turn || turn.attached || turn.cancelRequested || turn.steering) continue
     const since = turn.clientProgressAt ?? turn.lastProgressAt
     if (!staleTurnVerdict(proc, turn, now).stale && now - since < bound) continue
     if (!victim || since < victim.since) victim = { proc, turn, since }
@@ -2315,7 +3001,9 @@ async function withAcquireLocks(keys, fn) {
   return run(0)
 }
 
-async function acquireProc(agyPath, convKey, opts, isFreshConversation, forceNew = false) {
+// begin, when given, starts the turn inside the same locks, so a request that
+// waits on them sees this one's turn and is never handed a process about to be busy.
+async function acquireProc(agyPath, convKey, opts, isFreshConversation, forceNew = false, begin = null) {
   // Discover a live continued session's current key, lock it together with
   // the new key (sorted, to avoid deadlock), then pick again inside those
   // locks. A process is re-keyed only when its current key is already held.
@@ -2329,7 +3017,8 @@ async function acquireProc(agyPath, convKey, opts, isFreshConversation, forceNew
         const needed = candidate?.convKey
         if (needed && !locked.has(needed) && attempt < 2) return { retry: needed }
       }
-      return { value: await acquireProcLocked(agyPath, convKey, opts, isFreshConversation, forceNew, locked) }
+      const value = await acquireProcLocked(agyPath, convKey, opts, isFreshConversation, forceNew, locked)
+      return { value: begin ? { ...value, turn: await begin(value.proc, value.history) } : value }
     })
     if (outcome.retry) {
       extra = outcome.retry
@@ -2372,6 +3061,20 @@ async function acquireProcLocked(agyPath, convKey, opts, isFreshConversation, fo
     const candidate = findLiveContinuedProc(opts)
     if (candidate && lockedKeys.has(candidate.convKey)) existing = rekeyProc(candidate, convKey)
   }
+  let why = "no_live"
+  let key = convKey
+  if (existing && !existing.dead && existing.turn && isFreshConversation && !forceNew &&
+    !opts.hasToolResults && !existing.turn.cancelRequested && existing.turn.model !== opts.model) {
+    // A new conversation that opens as a running one did (one system prompt and
+    // one first message), for another model, is a conversation of its own, not
+    // a resend of the running one: magpie's Test models sends every model the
+    // same "hi" at once (swang20201 on X). It gets an agy of its own, under a
+    // key of its own; its follow-ups key as the first. The same request for
+    // the same model while the first runs is still refused as a resend.
+    key = `${convKey}#${opts.reqId || randomBytes(4).toString("hex")}`
+    existing = null
+    why = "concurrent_opening"
+  }
   if (existing) {
     if (!existing.dead && existing.turn) {
       throw new BusyError("agy bridge: this conversation still has an unfinished response")
@@ -2399,13 +3102,12 @@ async function acquireProcLocked(agyPath, convKey, opts, isFreshConversation, fo
         existing.openingImages = openingImagesOf(first)
       }
       await existing.updateTools(opts.tools)
-      logBridgeEvent(existing, null, "session_reused", continuedFresh ? "flattened_history" : "compatible_history", opts)
       return { proc: existing, history: matchedHistory }
     }
-    logBridgeEvent(existing, null, "session_replaced", forceNew ? "forced_replay" :
-      existing.workDir !== opts.workDir ? "work_directory_changed" :
-      !sameInstructions(existing.instructions, opts.instructions) ? "instructions_changed" :
-      existing.dead ? "process_dead" : existing.retiring ? "process_retiring" : "history_mismatch", opts)
+    why = forceNew ? "forced" : existing.dead ? "dead" : existing.retiring ? "retiring" :
+      existing.workDir !== opts.workDir ? "work_dir" :
+      !sameInstructions(existing.instructions, opts.instructions) ? "instructions" :
+      !(existing.matchesHistory(matchedHistory) || continuedFresh) ? "history" : "fresh_after_first"
     existing.retiring = true
     dropFromPool(existing)
     await existing.stop().catch(() => {})
@@ -2416,22 +3118,27 @@ async function acquireProcLocked(agyPath, convKey, opts, isFreshConversation, fo
     }
   }
   const resume = forceNew || isFreshConversation ? null : takeParked(convKey, opts)
-  const proc = new Proc(agyPath, convKey, { ...opts, resume })
+  const proc = new Proc(agyPath, key, { ...opts, resume })
   try {
     await proc.start()
   } catch (error) {
     await proc.stop().catch(() => {})
     throw error
   }
-  pool.set(convKey, proc)
-  logBridgeEvent(proc, null, resume ? "session_resumed" : "session_created", resume ? "persisted_session" : forceNew ? "forced_replay" : "no_compatible_session", opts)
+  pool.set(key, proc)
+  // Why this request got a new agy session, so a cache that never hits can be
+  // traced to the check that failed (#1058). Counts only, never content.
+  logSessionEvent(proc, why, {
+    fresh: !!isFreshConversation, resumed: !!proc.resumed,
+    parked: !!resume, history: Array.isArray(opts.history) ? opts.history.length : null,
+  })
   return { proc, history: opts.history }
 }
 
 // Bounded, content-free events: never log prompts, arguments, results or tool IDs.
 const HOST_EPOCH = randomBytes(4).toString("hex")
 const EVENT_WINDOW_MS = 60_000
-const EVENT_MAX_PER_WINDOW = positiveTimeout(process.env.AGY_BRIDGE_EVENT_LIMIT, 120)
+const EVENT_MAX_PER_WINDOW = 30
 let eventWindowStart = 0
 let eventWindowCount = 0
 // Rows dropped by the rate limit; reported on the next row that gets through.
@@ -2465,7 +3172,6 @@ function logBridgeEvent(proc, turn, action, reason, meta = {}, extra = {}) {
     event: "agy_bridge_tool_state", host_epoch: HOST_EPOCH, ts: now,
     req_id: meta?.reqId ?? null,
     conv: convKey ? digest(convKey).slice(0, 12) : null, turn_id: turn?.turnId ?? null,
-    session_id: proc?.sessionId ?? null,
     action, reason, attached: !!turn?.attached, done: !!turn?.done, dead: !!(proc?.dead || proc?.stopping),
     pending: turn ? pendingCallCount(turn) : 0,
     idle_ms: turn ? Math.max(0, now - turn.lastProgressAt) : null,
@@ -2477,6 +3183,21 @@ function logBridgeEvent(proc, turn, action, reason, meta = {}, extra = {}) {
     row.suppressed = eventSuppressed
     eventSuppressed = 0
   }
+  try { process.stderr.write("[agy-bridge] " + JSON.stringify(row) + "\n") } catch {}
+}
+
+// One row per new agy session, on a budget of its own so it never crowds out
+// the tool-state rows above.
+let sessionWindowStart = 0
+let sessionWindowCount = 0
+
+function logSessionEvent(proc, reason, extra) {
+  if (process.env.AGY_BRIDGE_EVENTS === "0") return
+  const now = Date.now()
+  if (now - sessionWindowStart >= EVENT_WINDOW_MS) { sessionWindowStart = now; sessionWindowCount = 0 }
+  if (sessionWindowCount++ >= EVENT_MAX_PER_WINDOW) return
+  const row = { event: "agy_bridge_session", host_epoch: HOST_EPOCH, ts: now,
+    conv: proc?.convKey ? digest(proc.convKey).slice(0, 12) : null, action: "session_new", reason, ...extra }
   try { process.stderr.write("[agy-bridge] " + JSON.stringify(row) + "\n") } catch {}
 }
 
@@ -2503,6 +3224,7 @@ function noteNoProgressRepeat(convKey, turn, now = Date.now()) {
 function staleTurnVerdict(proc, turn, now = Date.now()) {
   if (!turn || turn.cancelRequested) return { stale: false, reason: "cancelling" }
   if (turn.attached) return { stale: false, reason: "attached" }
+  if (turn.steering) return { stale: false, reason: "steering" }
   if (turn.finalized) return { stale: true, reason: "finalized" }
   if (proc.dead || proc.stopping) return { stale: true, reason: "dead" }
   if (turn.done) return { stale: true, reason: "done" }
@@ -2513,7 +3235,7 @@ function staleTurnVerdict(proc, turn, now = Date.now()) {
 // A pending tool turn only owns its own line of history, not a sibling request
 // that continues its base without carrying any of the emitted tool calls.
 function lineageVerdict(proc, turn, opts) {
-  if (!turn || turn.attached || turn.cancelRequested || turn.done || turn.finalized) return null
+  if (!turn || turn.attached || turn.cancelRequested || turn.steering || turn.done || turn.finalized) return null
   if (proc.dead || proc.stopping || proc.retiring || !turn.hasPendingMcp()) return null
   const history = opts.history
   const base = turn.baseHistory
@@ -2608,7 +3330,7 @@ async function recoverStaleTurn(ctx) {
     const verdict = staleTurnVerdict(current, held)
     // Lineage supersession belongs to acquisition of a new prompt. Unmatched
     // results alone reclaim an unexpired owner only at the repeat limit.
-    if (!verdict.stale && (!forced || verdict.reason === "attached")) {
+    if (!verdict.stale && (!forced || verdict.reason === "attached" || verdict.reason === "steering")) {
       logBridgeEvent(current, held, "reject_active", verdict.reason, ctx.acquireOpts, extra)
       return { kind: "active" }
     }
@@ -2785,6 +3507,28 @@ function stripVolatileSystem(text) {
 
 function instructionsIdentity(text) {
   return compactIdentity(stripVolatileSystem(text))
+}
+
+// sentInstructionsIdentity is the instructions as agy was handed them
+// (outgoing: the lines Antigravity turns away reworded), as a parked
+// session is keyed. A session agy opened with a line a later version
+// rewords keeps that line in its own copy, and every turn on it is turned
+// away, so when the rewording changes, the session is not resumed and a
+// new one is opened with the instructions as they go now (#1151).
+// USER_CLOAK marks a session parked since its prompts went as cloakUser
+// says. One parked before keeps a user's turn with Codex's GPT-5 line as
+// written in agy's own copy, and every turn on it would be turned away, so
+// it is not resumed: a new session gets the history as it goes now.
+const USER_CLOAK = 1
+// A parked entry's instructionsInSession says where its instructions went.
+// A session agy opened with them appended keeps them in its own system
+// instruction, so every turn on it is turned away as before; it is resumed
+// only while they still go there (AGY_BRIDGE_SYSTEM_APPEND=1). One parked
+// before the field was written is not resumed: a new session gets them in
+// its first turn.
+
+function sentInstructionsIdentity(text) {
+  return compactIdentity(outgoing(stripVolatileSystem(text)))
 }
 
 // Message text used for conversation/history identity: billing header lines,
@@ -3094,7 +3838,13 @@ function historyKey(messages) {
         ids.set(block.id, ordinal)
         value = { type: "tool_use", id: ordinal, name: block.name, input: block.input ?? {} }
       } else if (block.type === "tool_result") {
-        value = { type: "tool_result", id: ids.get(block.tool_use_id) ?? block.tool_use_id, ...toolResult(block) }
+        const result = toolResult(block)
+        // An image a tool returned is keyed by its hash, as a user's image
+        // is, not copied whole into the key on every round-trip (plugins#1137).
+        const content = result.content.map((part) => part.type === "image"
+          ? { type: "image", mimeType: part.mimeType, sha256: digest(part.data) }
+          : part)
+        value = { type: "tool_result", id: ids.get(block.tool_use_id) ?? block.tool_use_id, ...result, content }
       } else if (block.type === "server_tool_use" || block.type === "mcp_tool_use" ||
         block.type === "container_upload" || SERVER_TOOL_RESULT_BLOCK_TYPES.has(block.type)) {
         value = { type: block.type, name: block.name || "", content: renderServerAssistantBlock(block) }
@@ -3146,9 +3896,9 @@ function assistantTextOf(message) {
 // run: runStart = first message of the trailing text-only assistant run,
 // boundary = history split point (after the last assistant message before the
 // run, the session ledger's newest entry). Returns null when the request does
-// not end with a text-only assistant run. Known limits: a request combining a
-// live tool_result with a prefill tail is rejected in validateBody; a run with
-// no user message before it (contiguous assistant tail, e.g. a client re-sending
+// not end with a text-only assistant run. The local continuation extension also
+// supports a live tool_result followed by a prefill. A run with no user message
+// before it (contiguous assistant tail, e.g. a client re-sending
 // a completed reply with a prefill appended) puts the whole run in the tail, so
 // that one turn degrades to a fresh session (safe, self-healing).
 function prefillRun(messages) {
@@ -3423,7 +4173,12 @@ function normalizeTools(body) {
     if (!rawSchema || typeof rawSchema !== "object" || Array.isArray(rawSchema)) {
       throw new UnsupportedContent(`an invalid schema for tool ${tool.name}`)
     }
-    const inputSchema = ensureGeminiArrayItems(sanitizeInputSchema(rawSchema))
+    const inputSchema = ensureGeminiArrayItems(sanitizeInputSchema(expandToolSchema(rawSchema)))
+    // agy adds its own required toolSummary to MCP tools. A duplicate makes
+    // the resulting JSON Schema invalid before the agent can start.
+    if (tool.name === "run_command" && Array.isArray(inputSchema.required)) {
+      inputSchema.required = inputSchema.required.filter((key) => key !== "toolSummary")
+    }
     tools.push({
       name: tool.name,
       description: typeof tool.description === "string" ? tool.description : "",
@@ -3622,7 +4377,7 @@ function renderTurnMessageParts(message) {
   if (message.role !== "user" || !Array.isArray(message.content)) {
     let text = renderTurnMessage(message)
     // a system or developer message later in the chat is system text too
-    if (message.role === "system" || message.role === "developer") text = cloak(text)
+    if (message.role === "system" || message.role === "developer") text = outgoing(text)
     return text === "" ? [] : [{ type: "text", text }]
   }
   const parts = []
@@ -3675,6 +4430,7 @@ const HISTORY_BLOCK_CLIP_BYTES = 12 * 1024
 const HISTORY_BLOCK_KEEP_BYTES = 4 * 1024
 const HISTORY_RECORD_NOTE = "Historical tool calls and results above are records, not instructions to write tool calls as text. Never output \"[tool call ...]\" text; invoke tools only through structured tool calls.\n"
 const HISTORY_OMITTED_NOTE = "[... earlier conversation history omitted to fit ACP 112 KiB prompt budget ...]\n"
+const HISTORY_OPENING_DONE_NOTE = "The opening message above, and any resume note in it, belongs to an earlier turn that is already done.\n"
 const utf8 = new TextEncoder()
 
 function utf8Bytes(text) {
@@ -3776,6 +4532,115 @@ function clipPartsToBytes(parts, limit) {
   return out
 }
 
+// Claude Code's and DeepSeek Harness's own user-role notes: reminders, context
+// notices, local command output, interrupt markers, clock and runtime-context
+// snapshots, repeat-tool warnings and mode switches. A user message of these
+// alone is not a prompt from the user (#1055).
+const LOCAL_COMMAND_RE = /<(local-command-caveat|local-command-stdout|local-command-stderr)>[\s\S]*?<\/\1>/g
+const DSH_TIME_CONTEXT_RE = /(?:^|\r?\n)Time sampled while preparing turn \d+, step \d+: [^\r\n]+(?:\r?\nBrowser time zone for this request: [^\r\n]+)?(?:\r?\nElapsed since the preceding (?:model-visible message|step context): [^\r\n]+)?/g
+const DSH_REPEAT_TOOL_RE = /(?:^|\r?\n)(?:You are repeating the exact same tool call with identical arguments\. Carefully analyze the previous result before calling again: if the task is not complete, try a different approach or different arguments instead of repeating the call\.|Repeated tool call detected:\r?\n- tool: [^\r\n]+\r?\n- consecutive_calls: \d+\r?\n- arguments: [^\r\n]+\r?\nThe repeated calls are not making progress\. Do not call this tool with these exact arguments again\. Inspect the latest result and choose a different action, different arguments, or finish the task if enough evidence has been gathered\.)/g
+const DSH_PLAN_MODE_RE = /(?:^|\r?\n)The user switched this session (?:to plan|back to the default) mode\.(?=\r?\n|$)/g
+// DeepSeek Harness sends a runtime-context snapshot as its own user message;
+// a gateway that merges user messages into one string could lose text after it.
+const DSH_RUNTIME_SNAPSHOT_RE = /^Current runtime context(?:\. This snapshot supersedes earlier runtime-context snapshots\.(?:\r?\n[\s\S]*)?|: none\. Earlier runtime-context snapshots no longer apply\.)$/
+
+function isMetaOnlyUserText(text) {
+  const rest = stripMagpiePlaceholderNotice(text)
+    .replace(SYSTEM_REMINDER_RE, "")
+    .replace(CONTEXT_NOTICE_RE, "")
+    .replace(LOCAL_COMMAND_RE, "")
+    .replace(DSH_TIME_CONTEXT_RE, "")
+    .replace(DSH_REPEAT_TOOL_RE, "")
+    .replace(DSH_PLAN_MODE_RE, "")
+    .replace(/\[Request interrupted by user(?: for tool use)?\]/g, "")
+    .replace(/\[(?:SYSTEM NOTIFICATION|MESSAGE FROM NON-USER SOURCE) - NOT USER INPUT\]/g, "")
+    .trim()
+  return !rest || DSH_RUNTIME_SNAPSHOT_RE.test(rest)
+}
+
+function isToolResultMessage(message) {
+  return Array.isArray(message?.content) && message.content.some((block) => block?.type === "tool_result")
+}
+
+// A user message with no tool result and something the user wrote or attached.
+function isUserTask(message) {
+  if (message?.role !== "user") return false
+  if (typeof message.content === "string") return !isMetaOnlyUserText(message.content)
+  if (!Array.isArray(message.content) || isToolResultMessage(message)) return false
+  if (message.content.some((block) => block?.type === "image")) return true
+  return message.content.some((block) => !isMetaOnlyUserText(blockText(block)))
+}
+
+// Index right after the last completed assistant reply (an assistant run with
+// no tool_use), or 0 when the conversation is still in its first turn.
+function lastCompletedTurnEnd(history) {
+  for (let end = history.length; end > 0;) {
+    if (history[end - 1].role !== "assistant") {
+      end--
+      continue
+    }
+    let start = end - 1
+    while (start > 0 && history[start - 1].role === "assistant") start--
+    const hasToolUse = history.slice(start, end).some((message) =>
+      Array.isArray(message.content) && message.content.some((block) => block?.type === "tool_use"))
+    if (!hasToolUse) return end
+    end = start
+  }
+  return 0
+}
+
+// Bounds of the non-assistant, non-tool_result run around `index` when at
+// least one message in it is a user task; null when the run is meta-only.
+function userTurnRun(history, index) {
+  if (index < 0 || index >= history.length) return null
+  let start = index
+  while (start > 0 && history[start - 1].role !== "assistant" && !isToolResultMessage(history[start - 1])) start--
+  let end = index + 1
+  while (end < history.length && history[end].role !== "assistant" && !isToolResultMessage(history[end])) end++
+  const all = []
+  const tasks = []
+  const rest = []
+  for (let i = start; i < end; i++) {
+    if (i === 0) continue
+    all.push(i)
+    if (isUserTask(history[i])) tasks.push(i)
+    else rest.push(i)
+  }
+  const hasTask = tasks.length > 0 || (start === 0 && end > 0 && isUserTask(history[0]))
+  return hasTask ? { all, tasks, rest } : null
+}
+
+// The user-turn run that opened the active tool loop, if any.
+function loopOpeningRun(history, loopStart) {
+  for (let i = loopStart; i < history.length; i++) {
+    if (history[i].role === "assistant" || isToolResultMessage(history[i])) break
+    if (isUserTask(history[i])) return userTurnRun(history, i)
+  }
+  return null
+}
+
+// The latest user-turn run at or after `loopStart`, never reaching back into
+// an earlier completed turn.
+function latestLoopTaskRun(history, loopStart) {
+  for (let i = history.length - 1; i >= loopStart; i--) {
+    if (isUserTask(history[i])) return userTurnRun(history, i)
+  }
+  return null
+}
+
+// Byte size of `indices` (sorted, unique) plus an omission note for each gap.
+function keptSliceBytes(indices, totalLength, entries, noteBytes) {
+  let bytes = 0
+  let next = 0
+  for (const i of indices) {
+    if (i > next) bytes += noteBytes
+    bytes += entries[i].bytes
+    next = i + 1
+  }
+  if (next < totalLength) bytes += noteBytes
+  return bytes
+}
+
 // `reserveBytes` is text the caller appends after </current_turn>.
 function renderInitialPromptParts(body, callerWorkDir, instructionsInSession, reserveBytes = 0) {
   const { history, messages: current } = trailingMessages(body)
@@ -3783,7 +4648,7 @@ function renderInitialPromptParts(body, callerWorkDir, instructionsInSession, re
   const head = []
   if (!instructionsInSession) {
     const system = systemText(body)
-    if (system.trim()) appendPrompt(head, `<external_system_instructions>\n${cloak(system)}\n</external_system_instructions>\n`)
+    if (system.trim()) appendPrompt(head, `<external_system_instructions>\n${outgoing(system)}\n</external_system_instructions>\n`)
     if (callerWorkDir) appendPrompt(head, `\n${workDirNote(callerWorkDir)}\n\n`)
   }
   const currentParts = renderTurnMessagesParts(current)
@@ -3805,31 +4670,81 @@ function renderInitialPromptParts(body, callerWorkDir, instructionsInSession, re
     headParts = clipPartsToBytes(headParts, Math.max(0, budget - frame - promptTextBytes(turn)))
   }
   let room = budget - frame - promptTextBytes(headParts) - promptTextBytes(turn)
-  const entries = history.map((message) => {
-    const parts = renderHistoryEntry(clipHistoryMessage(message))
+  const render = (message) => {
+    const parts = renderHistoryEntry(message)
     return { parts, bytes: promptTextBytes(parts) }
-  })
+  }
+  const overRoom = (list) => list.reduce((sum, entry) => sum + entry.bytes, 0) > room
+  // A replay that fits is sent whole; only one that does not has its big
+  // blocks clipped first (#1055).
+  let entries = history.map(render)
+  if (overRoom(entries)) entries = history.map((message) => render(clipHistoryMessage(message)))
   let kept = entries
-  if (entries.reduce((sum, entry) => sum + entry.bytes, 0) > room) {
-    // Keep the opening anchor message and the newest messages that still fit;
-    // the early middle of the conversation gives way to one omission note.
-    room -= utf8Bytes(HISTORY_OMITTED_NOTE)
-    const anchor = entries[0] && entries[0].bytes <= room ? entries[0] : null
-    if (anchor) room -= anchor.bytes
-    const tail = []
-    for (let i = entries.length - 1; i > (anchor ? 0 : -1); i--) {
-      if (entries[i].bytes > room) break
-      room -= entries[i].bytes
-      tail.unshift(entries[i])
+  let showOpeningDone = false
+  if (overRoom(entries)) {
+    const noteBytes = utf8Bytes(HISTORY_OMITTED_NOTE)
+    const inToolLoop = current.some(isToolResultMessage)
+    const loopStart = inToolLoop ? lastCompletedTurnEnd(history) : history.length
+    const openingDoneBytes = utf8Bytes(HISTORY_OPENING_DONE_NOTE)
+    let reservedOpeningDone = false
+    if (room < noteBytes) {
+      kept = []
+    } else {
+      if (inToolLoop && loopStart > 0 && room >= noteBytes + openingDoneBytes) {
+        reservedOpeningDone = true
+        room -= openingDoneBytes
+      }
+      // Keep the opening anchor message and the newest messages that still fit;
+      // the early middle of the conversation gives way to omission notes.
+      let keep = []
+      if (entries.length && keptSliceBytes([0], entries.length, entries, noteBytes) <= room) {
+        keep.push(0)
+      }
+      // Mid tool loop, the user's prompt run that started it says what the loop is
+      // for (plus any later user steer run): keep it after the anchor, with a note
+      // for each gap (#1053, #1055).
+      if (inToolLoop) {
+        const runs = [loopOpeningRun(history, loopStart), latestLoopTaskRun(history, loopStart)].filter(Boolean)
+        const whole = [...new Set([...keep, ...runs.flatMap((run) => run.all)])].sort((a, b) => a - b)
+        if (whole.length > keep.length && keptSliceBytes(whole, entries.length, entries, noteBytes) <= room) {
+          keep = whole
+        } else {
+          const order = [...new Set([...runs.flatMap((run) => run.tasks), ...runs.flatMap((run) => run.rest)])]
+          for (const idx of order) {
+            if (keep.includes(idx)) continue
+            const nextKeep = [...keep, idx].sort((a, b) => a - b)
+            if (keptSliceBytes(nextKeep, entries.length, entries, noteBytes) <= room) keep = nextKeep
+          }
+        }
+      }
+      let left = room - keptSliceBytes(keep, entries.length, entries, noteBytes)
+      const tail = []
+      const floor = keep.length ? keep.at(-1) : -1
+      for (let i = entries.length - 1; i > floor; i--) {
+        const cost = entries[i].bytes - (i === floor + 1 ? noteBytes : 0)
+        if (cost > left) break
+        left -= cost
+        tail.unshift(i)
+      }
+      const keptIndices = [...keep, ...tail]
+      kept = []
+      let next = 0
+      for (const i of keptIndices) {
+        if (i > next) kept.push(null)
+        kept.push(entries[i])
+        next = i + 1
+      }
+      if (next < entries.length) kept.push(null)
+      showOpeningDone = reservedOpeningDone && keep.includes(0) && kept.includes(null) &&
+        keptIndices.some((i) => i >= loopStart && isUserTask(history[i]))
     }
-    kept = anchor ? [anchor, null, ...tail] : [null, ...tail]
-    if (room < 0) kept = []
   }
   const out = []
   appendPrompt(out, headParts)
   if (history.length) {
     appendPrompt(out, historyOpen)
     for (const entry of kept) appendPrompt(out, entry ? entry.parts : HISTORY_OMITTED_NOTE)
+    if (showOpeningDone) appendPrompt(out, HISTORY_OPENING_DONE_NOTE)
     appendPrompt(out, historyClose)
   }
   appendPrompt(out, turnOpen)
@@ -4118,11 +5033,11 @@ function inspectToolTurn(results, body) {
           // the gateway's wrapper for a developer message, or a system one
           const inner = wrapped ? wrapped[1] : rest
           if (extractQueuedPrompt(inner) !== null || userInterruption.test(inner)) userSteered = true
-          else if (!isNoise(inner)) notices.push(cloak(inner))
+          else if (!isNoise(inner)) notices.push(outgoing(inner))
         } else if (message.role === "user") {
           userSteered = true
         } else if (!isNoise(rest)) {
-          notices.push(cloak(rest))
+          notices.push(outgoing(rest))
         }
         continue
       }
@@ -4130,7 +5045,7 @@ function inspectToolTurn(results, body) {
         if (extractQueuedPrompt(rest) !== null || userInterruption.test(rest)) {
           userSteered = true
         } else if (!isNoise(rest)) {
-          notices.push(cloak(rest))
+          notices.push(outgoing(rest))
         }
       } else if (!isNoise(rest)) {
         if ((hookOutput.test(rest) || claudeMetaFeedback.test(rest)) && !userInterruption.test(rest)) {
@@ -4142,7 +5057,7 @@ function inspectToolTurn(results, body) {
         } else {
           // text from neither the user nor the system (an assistant message
           // that landed after the result): the model is told it, as a notice
-          notices.push(cloak(rest))
+          notices.push(outgoing(rest))
         }
       }
     }
@@ -4321,8 +5236,9 @@ function tokenCount(value) {
 }
 
 // ACP reports uncached input and cached reads as independent counters.
+// outputTokens already includes thoughtTokens; retain the deployed accounting
+// convention rather than inferring a cache-inclusive shape when total is absent.
 const FIELDS = ["input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens", "output_tokens"]
-
 
 function hasCount(object, field) {
   const value = object?.[field]
@@ -4360,11 +5276,6 @@ function cacheReadRatio(raw) {
   const read = tokenCount(raw.cachedReadTokens)
   return input + read > 0 ? read / (input + read) : undefined
 }
-
-
-
-
-
 function estimateStepUsage({ inputEstimate = 0, inputTokenScale = 1, lastCacheRatio, priorUsages = [], outputEstimate = 0, thinkingEstimate = 0 } = {}) {
   const scale = Number.isFinite(inputTokenScale) ? Math.max(0.5, Math.min(1.5, inputTokenScale)) : 1
   const window = tokenCount(tokenCount(inputEstimate) * scale)
@@ -4381,6 +5292,16 @@ function estimateStepUsage({ inputEstimate = 0, inputTokenScale = 1, lastCacheRa
   })
 }
 
+
+// The deployed AGY CLI reports uncached input and cached reads separately.
+function promptUsage(usage) {
+  const normalized = normalizeAcpUsage(usage)
+  const input = normalized?.input_tokens || 0
+  const read = normalized?.cache_read_input_tokens || 0
+  return { input, read, write: normalized?.cache_creation_input_tokens || 0,
+    output: normalized?.output_tokens || 0, thinking: normalized?.output_tokens_details?.thinking_tokens || 0,
+    promptInput: input + read }
+}
 
 function translateUsage(usage) { return normalizeAcpUsage(usage) }
 
@@ -4401,11 +5322,182 @@ function responseOutputEstimate(content) {
   return { output: tokenCount(output), thinking: tokenCount(thinking) }
 }
 
+// Usage for one HTTP response. ACP reports one accumulated total for a whole
+// session/prompt, which may span several HTTP responses (tool round-trips and
+// late tool results). Reporting that total on the last response makes clients
+// bill the earlier steps again, so each response settles on its own:
+//   - a lone model call keeps the exact ACP numbers;
+//   - tool-step responses get a non-zero estimate scaled by what earlier
+//     responses taught us about this model's tokenizer and cache hit rate;
+//   - the final response gets the ACP input total split by this step's share
+//     of the estimated input, never above 1.5x its own estimate.
+function responseUsage(proc, turn, step, content, result) {
+  if (step.settled) return step.usage
+  const final = result !== undefined
+  const translated = final ? translateUsage(result?.usage) : null
+  const single = final && result?.stopReason !== "cancelled" && !turn.calls.length &&
+    !turn.toolResponseCount && !turn.hasLatePrompt && turn.promptCount <= 1 && turn.responseSteps.length === 1
+  step.usageKind = single && translated ? "exact" : "bounded_step_estimate"
+  if (single && translated) return translated
+
+  const estimate = turn.stepInputEstimates[step.estimateIndex] || step.inputEstimate
+  const scale = Number.isFinite(proc.inputTokenScale) ? Math.max(0.5, Math.min(1.5, proc.inputTokenScale)) : 1
+  let cacheRatio = Number.isFinite(proc.lastCacheRatio) ? Math.max(0, Math.min(1, proc.lastCacheRatio)) : 0
+  let input = Math.max(1, tokenCount(estimate * scale))
+  let write = 0
+  if (final) {
+    const sum = turn.stepInputEstimates.reduce((total, value) => total + value, 0)
+    const weight = estimate / Math.max(estimate, sum)
+    const parts = promptUsage(result?.usage || {})
+    const totalInput = parts.promptInput
+    const totalWrite = parts.write
+    if (totalInput + totalWrite > 0) {
+      input = tokenCount(totalInput * weight)
+      write = tokenCount(totalWrite * weight)
+      cacheRatio = totalInput > 0 ? parts.read / totalInput : 0
+    }
+    // The bound applies to the full window, including cache creation. Scale
+    // both portions together before rounding, then split the exact integer.
+    const combined = input + write
+    const bounded = Math.min(tokenCount(estimate * 1.5), combined)
+    write = combined > 0 ? Math.min(bounded, tokenCount(bounded * (write / combined))) : 0
+    input = bounded - write
+  } else if (!Number.isFinite(proc.lastCacheRatio)) {
+    // Intermediate HTTP steps of one still-open session/prompt have no ACP
+    // usage yet. c27ba5f already teaches lastCacheRatio from each finished
+    // prompt's ACP cachedReadTokens when input > 0 (including cancelled
+    // prompts and a recorded 0). This branch runs only while
+    // lastCacheRatio is still unset — typically a fresh process whose
+    // first prompt has not recorded usage, and also a later prompt if no
+    // earlier usage had input > 0. Later tool-round estimates would
+    // otherwise rebill the already-sent prefix as uncached. Treat earlier
+    // settled steps of this turn as the implicit-cache prefix; the first
+    // step stays uncached. This is a bounded step estimate, not
+    // ACP-reported usage. A finite ratio already learned from
+    // recordPromptUsage, including a calibrated 0, is left unchanged.
+    //
+    // prior is the largest earlier settled step's full window (input +
+    // cache_read + cache_creation): each step's window already holds every
+    // step before it, so that is the prefix sent before. Summing the
+    // windows counted the prefix once per step, and from the third step on
+    // billed the tool result just added as cached too.
+    const prior = turn.responseSteps.reduce((largest, item) => {
+      if (item === step || !item.settled || !item.usage) return largest
+      return Math.max(largest, tokenCount(item.usage.input_tokens) +
+        tokenCount(item.usage.cache_read_input_tokens) +
+        tokenCount(item.usage.cache_creation_input_tokens))
+    }, 0)
+    if (prior > 0) cacheRatio = Math.min(1, prior / input)
+  }
+  const read = Math.min(input, tokenCount(input * cacheRatio))
+  const emitted = responseOutputEstimate(content)
+  const output = final
+    ? Math.max(emitted.output, tokenCount((translated?.output_tokens || 0) - turn.emittedOutputTokens))
+    : Math.max(1, emitted.output)
+  const thinking = Math.min(output, emitted.thinking)
+  return {
+    input_tokens: input - read,
+    cache_read_input_tokens: read,
+    cache_creation_input_tokens: write,
+    output_tokens: output,
+    ...(thinking > 0 ? { output_tokens_details: { thinking_tokens: thinking } } : {}),
+  }
+}
+
+// Usage of one HTTP response from agy's own per-call records (step-usage.mjs):
+// the model calls since the last settled response. Its prompt buckets are the
+// latest call's, which is how full the context is; output adds up all of them.
+// Returns null, keeping the estimate, when the store has no new completed call
+// in time or, at the end of a prompt, its calls don't yet add up to ACP's total.
+async function measuredUsage(turn, step, content, result) {
+  if (step.settled || !turn.stepsFile || turn.stepCursor == null) return null
+  const final = result !== undefined
+  const acp = final && result?.usage ? promptUsage(result.usage) : null
+  const measured = turn.measured || { prompt: 0 }
+  const expected = acp ? acp.promptInput + acp.write : null
+  const promptOf = (steps) => steps.reduce((sum, item) => sum + item.input + item.read + item.write, measured.prompt)
+  const complete = (steps) => {
+    if (!steps?.length) return false
+    if (expected === null) return true
+    return promptOf(steps) >= expected
+  }
+  // agy has written the store by its first tool call; none means none kept here.
+  if (!fs.existsSync(turn.stepsFile)) return null
+  // When an earlier response in this turn already measured a generation and no
+  // new message/thought chunk arrived, agy may still be draining sequential MCP
+  // tool calls from that same generation without invoking the model again. Wait
+  // briefly unless a new row is pending; stop immediately if the store fails/locks.
+  const sawOutput = turn.sawGenerationOutput ||
+    (Array.isArray(content) && content.some((block) => block?.type === "text" || block?.type === "thinking"))
+  const canShareGeneration = !final && !sawOutput && measured.prompt > 0 && turn.stepCursor.source !== null
+  const start = performance.now()
+  let batch = modelUsageAfter(turn.stepsFile, turn.stepCursor)
+  for (;;) {
+    if (!batch || complete(batch.steps)) break
+    const waitMs = canShareGeneration && !batch.pending
+      ? STEP_USAGE_SAME_GEN_WAIT_MS
+      : STEP_USAGE_WAIT_MS
+    if (performance.now() - start >= waitMs) break
+    await new Promise((resolve) => setTimeout(resolve, STEP_USAGE_POLL_MS))
+    batch = modelUsageAfter(turn.stepsFile, turn.stepCursor)
+  }
+  if (!batch) return null
+  const steps = batch.steps
+  if (!complete(steps)) {
+    if (!batch.pending && !steps?.length && (
+      canShareGeneration ||
+      (final && expected !== null && measured.prompt > 0 &&
+        measured.prompt >= expected &&
+        measured.prompt <= expected + Math.max(16, Math.ceil(expected * 0.01)))
+    )) {
+      if (final) turn.stepUsageReconciled = true
+      step.usageKind = "agy_same_generation"
+      step.modelCalls = 0
+      return {
+        input_tokens: 0,
+        cache_read_input_tokens: 0,
+        cache_creation_input_tokens: 0,
+        output_tokens: 0,
+      }
+    }
+    return null
+  }
+  // agy's per-call prompts sum to ACP's total exactly. A large over-count means
+  // the store's layout or contents no longer match what ACP reported, so don't
+  // hand the client numbers we cannot reconcile.
+  const prompt = promptOf(steps)
+  if (expected !== null && prompt > expected + Math.max(16, Math.ceil(expected * 0.01))) return null
+  const last = steps.at(-1)
+  // Store field 3 (output) already includes field 9 (thinking), matching ACP's outputTokens.
+  const output = steps.reduce((sum, item) => sum + Math.max(item.output, item.thinking), 0)
+  const thinking = steps.reduce((sum, item) => sum + item.thinking, 0)
+  turn.stepCursor = { source: batch.source, idx: last.idx }
+  turn.measured = { prompt }
+  if (final) turn.stepUsageReconciled = true
+  step.usageKind = "agy_model_call"
+  step.modelCalls = steps.length
+  logBridgeEvent(turn.proc, turn, "model_usage", batch.source, {}, {
+    model: turn.proc.currentModel, effort: turn.proc.currentEffort,
+    model_calls: steps.length,
+    input_tokens: last.input, cache_read_tokens: last.read, cache_write_tokens: last.write,
+    output_tokens: output, thinking_tokens: thinking,
+    context_tokens: last.input + last.read + last.write,
+    local_context_estimate: last.context,
+  })
+  return {
+    input_tokens: last.input,
+    cache_read_input_tokens: last.read,
+    cache_creation_input_tokens: last.write,
+    output_tokens: output,
+    ...(thinking > 0 ? { output_tokens_details: { thinking_tokens: thinking } } : {}),
+  }
+}
+
 // Prefer model-call usage from AGY's local transcript. ACP prompt totals
 // span tool round trips: retain them in rawAcpUsages, never present a multi-call
 // total as the last model's context window. Missing transcripts use a labeled,
 // bounded window estimate; a single-call prompt can use exact ACP counters.
-async function responseUsage(proc, turn, step, content, result) {
+async function transcriptResponseUsage(proc, turn, step, content, result) {
   if (step.settled) return step.usage
   const final = result !== undefined
   const recorded = await proc.transcriptUsage?.read()
@@ -4448,6 +5540,24 @@ async function responseUsage(proc, turn, step, content, result) {
   step.usageKind = "bounded_step_estimate"
   step.usageEstimate = guess
   return guess
+}
+
+async function settleUsage(proc, turn, step, content, result) {
+  if (proc.transcriptUsage) return transcriptResponseUsage(proc, turn, step, content, result)
+  if (step.settled) return step.usage
+  try {
+    const measured = result?.stopReason === "cancelled" ? null : await measuredUsage(turn, step, content, result)
+    if (measured) return measured
+    // Any unconsumed generation from this turn (cancelled, timed out, locked, or
+    // an empty `.pb` / unreadable store) could land after the next turn reads
+    // MAX(idx) or keep costing 1s per turn. Stop trusting the store on this
+    // process and fall back to bounded window estimates.
+    turn.stepCursor = null
+    if (turn.stepsFile) proc.stepUsageTrusted = false
+    return responseUsage(proc, turn, step, content, result)
+  } finally {
+    turn.sawGenerationOutput = false
+  }
 }
 
 // agy's ACP stream carries thought summaries without the model's own signature.
@@ -4628,7 +5738,9 @@ function makeAnthropicStream(proc, turn, body, msgId, signal, step = turn.regist
               }
               if (performance.now() >= batchDeadline) break
             }
-            stopMessage("tool_use", await responseUsage(proc, turn, step, responseContent))
+            const usage = await settleUsage(proc, turn, step, responseContent)
+            if (finished) return
+            stopMessage("tool_use", usage, false, step.usageKind === "agy_model_call")
             proc.recordAssistantResponse(turn, responseContent)
             detach()
             controller.close()
@@ -4637,7 +5749,8 @@ function makeAnthropicStream(proc, turn, body, msgId, signal, step = turn.regist
           if (event.type === "result") {
             closeBlock()
             turn.rawUsage = event.result.usage ?? turn.rawUsage
-            const usage = await responseUsage(proc, turn, step, responseContent, event.result)
+            const usage = await settleUsage(proc, turn, step, responseContent, event.result)
+            if (finished) return
             stopMessage(STOP_REASONS[event.result.stopReason] || "end_turn", usage, true, event.result.stopReason !== "cancelled")
             proc.recordAssistantResponse(turn, responseContent)
             proc.finalizeTurn(turn)
@@ -4647,10 +5760,7 @@ function makeAnthropicStream(proc, turn, body, msgId, signal, step = turn.regist
           }
           if (event.type === "error") {
             closeBlock()
-            send("error", {
-              type: "error",
-              error: { type: event.error?.kind || "api_error", message: String(event.error?.message ?? event.error) },
-            })
+            send("error", { type: "error", error: streamErrorOf(event.error) })
             if (!event.error?.keepProcess) {
               dropFromPool(proc)
               await proc.stop().catch(() => {})
@@ -4735,6 +5845,16 @@ function estimateInputTokens(body) {
   return Math.max(1, total + images * 1600)
 }
 
+function estimatePromptPartsTokens(parts) {
+  let total = 0
+  let images = 0
+  for (const part of parts || []) {
+    if (part?.type === "text" && part.text) total += estimateTextTokens(part.text)
+    else if (part?.type === "image") images++
+  }
+  return total + images * 1600
+}
+
 async function jsonResponseFromStream(stream, fallbackModel, fallbackId) {
   const reader = stream.getReader()
   const decoder = new TextDecoder()
@@ -4806,7 +5926,7 @@ async function jsonResponseFromStream(stream, fallbackModel, fallbackId) {
   if (buffer.trim()) processBlock(buffer)
 
   if (streamError) {
-    const status = streamError.type === "rate_limit_error" ? 429 : 502
+    const status = streamError.status || (streamError.type === "rate_limit_error" ? 429 : 502)
     return new Response(JSON.stringify({ type: "error", error: streamError }), {
       status,
       headers: { "Content-Type": "application/json" },
@@ -4836,85 +5956,251 @@ function streamResponse(proc, turn, body, signal) {
   })
 }
 
-// Cancelling an ACP prompt can race with delivery of an MCP reply. Preserve
-// the newly completed results in the steer's next prompt as receipts; reuse
-// the same session and never replay the older conversation or execute tools.
-function withSteerReceipts(messages, answered) {
+// Tool results a kept session already holds (answered to its live MCP calls
+// when the user steered) are not sent again in the steer's prompt.
+// An answered result's images are the exception: the call got its text only
+// (textOnlyResult), so its images go in the prompt, under the result's id.
+function withoutAnswered(messages, answered) {
   if (!answered?.size) return messages
-  return [{ role: "user", content: "The following client tool calls have already completed. Their real results are included below because generation was interrupted. Use these results; do not execute these calls again." }, ...messages]
+  return messages.map((message) => message.role === "user" && Array.isArray(message.content)
+    ? { ...message, content: message.content.flatMap((block) => {
+      if (!(block?.type === "tool_result" && answered.has(block.tool_use_id))) return [block]
+      const images = Array.isArray(block.content) ? block.content.filter((part) => part?.type === "image") : []
+      return images.length ? [{ ...block, content: images }] : []
+    }) }
+    : message)
 }
 
 async function beginTurn(proc, history, body, callerWorkDir, model, selection, answered) {
   const reminder = outputFormatReminder(body)
   const flattened = proc.pendingFlattenedTurn
   proc.pendingFlattenedTurn = null
-  const baseParts = proc.hasSentFirstTurn
+  const isFirstTurn = !proc.hasSentFirstTurn
+  const baseParts = !isFirstTurn
     ? renderContinuedTurnParts(flattened
       ? [flattened, ...body.messages.slice(1)]
-      : withSteerReceipts(body.messages.slice(history.length), answered))
+      : withoutAnswered(body.messages.slice(history.length), answered))
     : renderInitialPromptParts(body, callerWorkDir, proc.instructionsInSession,
       reminder.length ? promptTextBytes(reminder) + 2 : 0)
   const contentParts = mergePromptParts(baseParts, reminder)
   if (promptHasImage(contentParts) && !proc.supportsImages) {
-    if (!proc.hasSentFirstTurn) {
+    if (isFirstTurn) {
       dropFromPool(proc)
       await proc.stop().catch(() => {})
     }
     throw new UnsupportedContent("image input with this agy ACP server; update to an image-capable agy version")
   }
+  if (isFirstTurn) {
+    const rawEstimate = estimateInputTokens(body)
+    const sessionOverhead = (proc.instructionsInSession && body.system
+      ? estimateInputTokens({ system: body.system, messages: [] })
+      : 0) + (Array.isArray(body.tools) && body.tools.length ? estimateTextTokens(JSON.stringify(body.tools)) : 0)
+    const sentEstimate = Math.max(1, sessionOverhead + estimatePromptPartsTokens(contentParts))
+    const clipThreshold = Math.min(HISTORY_BLOCK_CLIP_BYTES, maxInitialPromptBytes())
+    const promptClipped = utf8Bytes(JSON.stringify(body.messages)) > clipThreshold &&
+      rawEstimate > sentEstimate + 64
+    proc.omittedHistoryTokens = promptClipped ? rawEstimate - sentEstimate : 0
+  }
   return proc.startTurn(contentParts, body.messages, model, selection)
 }
 
+// A magpie that installs a plugin's CLI (auth.cli) installs agy before it
+// gets here; an older one, or OpenCode, doesn't.
+function noAgy() {
+  return { type: "failed", error: `agy CLI not found. Update magpie and sign in again to have it installed, or install Antigravity CLI yourself: ${AGY_MANUAL}` }
+}
+
+// signedInAs is the sign-in's result, named by the Google account agy is
+// signed in to when its keyring (or token file) says (magpie shows the
+// account by it, not as "API key"). An account with a home of its own
+// (account.mjs) keeps the home's name with it, and a key of its own, so
+// two accounts whose email can't be read aren't taken for one.
+async function signedInAs(homeId = "") {
+  const email = await storedEmail()
+  const metadata = { ...(email ? { email } : {}), ...(homeId ? { agyHome: homeId } : {}) }
+  return { type: "success", key: homeId ? `agy:${homeId}` : "agy", ...(Object.keys(metadata).length ? { metadata } : {}) }
+}
+
+// googleSignIn runs agy's own Google sign-in: its link, then the code the
+// page shows. account ({ id, home }) is a new account's own home: agy
+// signs in there, and the home goes again when the sign-in fails.
+async function googleSignIn(agy, account = null) {
+  const home = account?.home ?? null
+  const fail = (error) => {
+    if (account) dropHome(home)
+    return { type: "failed", error }
+  }
+  const login = await inAccount(home, () => startLogin(agy))
+  if (login.error) return fail(login.error)
+  return {
+    url: login.url,
+    instructions: "",
+    method: "code",
+    callback: (code, opts = {}) => inAccount(home, async () => {
+      const done = await login.finish(code, { signal: opts.signal })
+      if (done.error) return fail(done.error)
+      // agy stored a new sign-in: read it again, and let what
+      // failed with the old one run again
+      forgetStoredSignIn({ dead: true })
+      // A new account: what agy offered the last one, or refused
+      // before the sign-in, is asked again.
+      forgetOffered()
+      const probe = await probeSignedIn(agy)
+      if (!probe.ok) return fail(`agy signed in, but ${probe.why}`)
+      return signedInAs(account?.id ?? "")
+    }),
+  }
+}
+
+// homeOfEmail is the id of the account home already signed in to email
+// ("" for agy's own sign-in), or null when none is.
+async function homeOfEmail(email) {
+  const want = email.toLowerCase()
+  if ((await storedEmail({ home: null })).toLowerCase() === want) return ""
+  let ids = []
+  try { ids = fs.readdirSync(accountsDir()) } catch {}
+  for (const id of ids) {
+    const home = homeOf(id)
+    if (home && (await storedEmail({ home })).toLowerCase() === want) return id
+  }
+  return null
+}
+
+// importSignIns brings in the accounts the texts hold (import.mjs): each
+// one an account home of its own, whose token file is the sign-in, kept
+// once agy lists the account's models with it. An account signed in here
+// already is left as it is and named again, so it isn't added twice.
+async function importSignIns(texts) {
+  const accounts = importedAccounts(texts)
+  if (!accounts.length) return { type: "failed", error: "no Antigravity sign-in in it: take the retired Antigravity plugin's sign-in or agy's token file" }
+  const agy = findAgy()
+  if (!agy) return noAgy()
+  const out = []
+  for (const a of accounts) {
+    const failed = (error) => ({ type: "failed", error, ...(a.email ? { accountId: a.email } : {}) })
+    if (a.email) {
+      const had = await homeOfEmail(a.email)
+      if (had !== null) {
+        out.push(await inAccount(homeOf(had), () => signedInAs(had)))
+        continue
+      }
+    }
+    let account
+    try {
+      account = newHome()
+      const file = tokenFile(account.home)
+      fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 })
+      fs.writeFileSync(file, tokenFileText(a), { mode: 0o600 })
+    } catch (error) {
+      if (account) dropHome(account.home)
+      out.push(failed(`couldn't make a folder for the account: ${error.message}`))
+      continue
+    }
+    out.push(await inAccount(account.home, async () => {
+      forgetStoredSignIn()
+      forgetOffered()
+      const probe = await probeSignedIn(agy)
+      if (!probe.ok) {
+        dropHome(account.home)
+        return failed(`agy couldn't sign in with it: ${probe.why}`)
+      }
+      return signedInAs(account.id)
+    }))
+  }
+  return out
+}
+
+// homeOfAuth is the home of the account a saved sign-in is, null for
+// agy's own.
+async function homeOfAuth(getAuth) {
+  let auth
+  try { auth = typeof getAuth === "function" ? await getAuth() : getAuth } catch {}
+  return homeOf(homeIdOfAuth(auth))
+}
+
+// One usage reader per account: each holds its own last report.
+const usageReaders = new Map()
+function readUsageOf(home) {
+  const key = home ?? ""
+  let read = usageReaders.get(key)
+  if (!read) usageReaders.set(key, (read = createUsageReader(findAgy)))
+  return inAccount(home, () => read())
+}
+
 export const AntigravityBridgePlugin = async () => {
-  const readUsage = createUsageReader(findAgy)
+  keepAgyCurrent(findAgy)
   return {
     auth: {
       provider: PROVIDER_ID,
-      single: true,
+      // Magpie's hook for the CLI a plugin runs through: a sign-in on a
+      // machine without agy (magpie in Docker) installs it first, into the
+      // plugin's own folder (install.mjs). OpenCode ignores it.
+      cli: {
+        name: "Antigravity CLI",
+        manual: AGY_MANUAL,
+        installed: async () => findAgy() !== null,
+        install: async ({ signal } = {}) => {
+          if (findAgy()) return
+          await installAgy({ signal })
+          if (!findAgy()) throw new Error("agy was installed, but the plugin can't run it")
+        },
+      },
       // Magpie's usage hook; OpenCode ignores this extension. agy owns auth.
-      usage: async () => readUsage(),
+      usage: async (getAuth) => readUsageOf(await homeOfAuth(getAuth)),
+      // magpie's "Import accounts from a file…" (OpenCode ignores it): the
+      // retired Antigravity plugin's sign-ins, which magpie's Move hands over
+      importFrom: IMPORT_FROM.en,
+      importFroms: IMPORT_FROM.froms,
+      import: (texts) => importSignIns(Array.isArray(texts) ? texts : [texts]),
       methods: [
         {
           // agy's own Google sign-in (`agy acp --login`): magpie opens its
           // link and takes the code the page shows. agy keeps the token;
           // the plugin's account is only "agy", saved once agy says the
-          // sign-in took and lists the account's models.
+          // sign-in took and lists the account's models. Signed in to agy
+          // already, nothing opens: the account agy has is the one saved.
           type: "oauth",
           label: "Sign in with Google",
+          labels: { zh: "使用 Google 登录", "zh-TW": "使用 Google 登入", ja: "Google でサインイン" },
           authorize: async () => {
             const agy = findAgy()
-            if (!agy) {
-              return {
-                type: "failed",
-                error: "agy CLI not found. Install Antigravity CLI first: https://antigravity.google/docs/cli",
-              }
-            }
-            // signed in to agy already: nothing to open
+            if (!agy) return noAgy()
             if ((await probeSignedIn(agy)).ok) {
-              return { url: "", instructions: "", method: "auto", callback: async () => ({ type: "success", key: "agy" }) }
+              return { url: "", instructions: "", method: "auto", callback: async () => signedInAs() }
             }
-            const login = await startLogin(agy)
-            if (login.error) return { type: "failed", error: login.error }
-            return {
-              url: login.url,
-              instructions: "",
-              method: "code",
-              callback: async (code, opts = {}) => {
-                const done = await login.finish(code, { signal: opts.signal })
-                if (done.error) return { type: "failed", error: done.error }
-                const probe = await probeSignedIn(agy)
-                if (!probe.ok) return { type: "failed", error: `agy signed in, but ${probe.why}` }
-                return { type: "success", key: "agy" }
-              },
+            return googleSignIn(agy)
+          },
+        },
+        {
+          // Another Google account beside the first: agy signs in to it in
+          // a home of its own (account.mjs), so the one agy has stays.
+          // Always a new sign-in, even while agy is signed in (the first
+          // way, signed in already, ends at once with nothing changed:
+          // Archivemylife on X, "Sign in again" did nothing).
+          type: "oauth",
+          label: "Add another Google account",
+          labels: { zh: "添加另一个 Google 账号", "zh-TW": "新增另一個 Google 帳號", ja: "別の Google アカウントを追加" },
+          authorize: async () => {
+            const agy = findAgy()
+            if (!agy) return noAgy()
+            let account
+            try {
+              account = newHome()
+            } catch (error) {
+              return { type: "failed", error: `couldn't make a folder for the account: ${error.message}` }
             }
+            return googleSignIn(agy, account)
           },
         },
       ],
-      loader: async () => {
+      loader: async (getAuth) => {
+        // the account's own home, null for agy's own sign-in: every agy
+        // its requests run is started there
+        const home = await homeOfAuth(getAuth)
         return {
           baseURL: "agy://local",
           apiKey: "agy",
-          fetch: async (fetchInput, init = {}) => {
+          fetch: (fetchInput, init = {}) => inAccount(home, async () => {
             const requestUrl = typeof fetchInput === "string"
               ? fetchInput
               : fetchInput instanceof URL
@@ -4940,6 +6226,14 @@ export const AntigravityBridgePlugin = async () => {
 
             const agy = findAgy()
             if (!agy) return jsonError(503, "agy CLI not found on this machine")
+            // nothing stored to sign agy in with: agy would only start its
+            // own Google sign-in, so the account is told to sign in again
+            // (from the last read; a request doesn't wait for a new one)
+            const notSignedIn = cannotSignIn(storedSignInNow())
+            if (notSignedIn) {
+              return jsonError(401, `${notSignedIn}: sign in again in magpie, or run \`agy\` in a terminal`, undefined,
+                { headers: { "X-Magpie-Sign-In": "expired" } })
+            }
             let body
             try {
               const raw = typeof init.body === "string" ? init.body : new TextDecoder().decode(init.body)
@@ -4957,7 +6251,8 @@ export const AntigravityBridgePlugin = async () => {
             body = { ...canonicalBody(body), model: requestedModel }
             const model = resolveAgyModel(await loadModelCatalog(agy), requestedModel, body)
             const selection = { model: requestedModel, effort: requestedEffort(body) }
-            const convKey = conversationKey(body)
+            // an account's conversations are its own: its agy has them
+            const convKey = (home ? `acct:${path.basename(home)}:` : "") + conversationKey(body)
             const trailing = trailingMessages(body)
             const isFresh = trailing.history.length === 0
             const resultBlocks = extractToolResults(body)
@@ -5005,6 +6300,7 @@ export const AntigravityBridgePlugin = async () => {
                   }
                   if (proc.turn !== turn) return jsonError(409, "agy bridge: the tool response has already completed")
                   if (turn.attached) throw new BusyError("agy bridge: this conversation already has an active response")
+                  if (turn.steering) throw new BusyError("agy bridge: this conversation is already steering this tool turn")
                   noProgressRepeats.delete(convKey) // matched results are real progress
                   const rawResults = matches.map(({ block, match }) => ({
                     block,
@@ -5012,8 +6308,7 @@ export const AntigravityBridgePlugin = async () => {
                     result: toolResult(block),
                   }))
                   proc.validateResults(rawResults)
-                  // A prefilled assistant continuation cannot settle a partial
-                  // parallel batch: preserve the owner until every result arrives.
+                  // Preserve the local prefill extension without dropping an unanswered sibling call.
                   const answeredCalls = new Set(rawResults.map(item => item.call))
                   if (prefillTailEnabled() && prefillRun(body.messages) && turn.calls.some(call =>
                     ((call.mcpSeen && !call.mcpResponded) || (call.deferred && !call.result)) && !answeredCalls.has(call))) {
@@ -5035,6 +6330,10 @@ export const AntigravityBridgePlugin = async () => {
                     }
                   }
                   if (!interrupted) proc.validateResults(results)
+                  // An image over MCP reaches agy's model as a path it can't
+                  // read, so a result with one takes the steer's way: the call
+                  // gets the text, the next prompt the image.
+                  const imageResult = proc.supportsImages && results.some((item) => resultHasImage(item.result))
                   const directIdsMatch = matches.every((item) => item.match?.call?.id === item.block.tool_use_id)
                   const historyMatches = directIdsMatch
                     ? proc.matchesPendingTurnHistory(turn, trailingMessages(body).history)
@@ -5042,20 +6341,20 @@ export const AntigravityBridgePlugin = async () => {
                   // A steer keeps the live session, so agy's prompt cache holds: the
                   // calls are answered with their real results, the step is
                   // cancelled, and the steer goes in as the next prompt.
-                  if (interrupted && historyMatches && !proc.toolsGrew(tools) && proc.workDir === workDir &&
+                  if ((interrupted || imageResult) && historyMatches && !proc.toolsGrew(tools) && proc.workDir === workDir &&
                     sameInstructions(proc.instructions, instructions) &&
                     await proc.steerInSession(turn, rawResults, trailingMessages(body).history)) {
-                    logBridgeEvent(proc, turn, "session_steered", "follow_up_in_session", acquireOpts)
                     keptSession = true
-                    answeredIds = new Set(rawResults.map((item) => item.block.tool_use_id))
-                  } else if (interrupted || !historyMatches || proc.toolsGrew(tools) ||
+                    answeredIds = new Set(
+                      rawResults
+                        .filter((item) => !item.call.deferred || item.call.lateDelivered)
+                        .map((item) => item.block.tool_use_id),
+                    )
+                  } else if (interrupted || imageResult || !historyMatches || proc.toolsGrew(tools) ||
                     proc.workDir !== workDir || !sameInstructions(proc.instructions, instructions)) {
                     // A changed context, a tool catalog that grew, or a
                     // user-interrupted tool turn needs a new session. Replay the
                     // real results without resolving the old process's calls.
-                    logBridgeEvent(proc, turn, "session_replaced", !historyMatches ? "tool_history_mismatch" :
-                      proc.toolsGrew(tools) ? "tools_grew" : proc.workDir !== workDir ? "work_directory_changed" :
-                      !sameInstructions(proc.instructions, instructions) ? "instructions_changed" : "steer_requires_replay", acquireOpts)
                     dropFromPool(proc)
                     proc.abandonTurn(turn)
                     await proc.stop()
@@ -5064,7 +6363,6 @@ export const AntigravityBridgePlugin = async () => {
                       // A tool catalog that lost or changed tools applies to the
                       // rest of this turn; a model change applies from the next prompt.
                       await proc.updateTools(tools)
-                      logBridgeEvent(proc, turn, "tool_continued", "compatible_tool_result", acquireOpts)
                       proc.continueWith(results)
                       proc.recordToolResults(turn, body.messages)
                     }
@@ -5077,7 +6375,7 @@ export const AntigravityBridgePlugin = async () => {
                   let attempts
                   if (!verdict.stale) {
                     // An attached stream is live progress; only a quiet turn counts.
-                    if (verdict.reason === "attached") noProgressRepeats.delete(convKey)
+                    if (verdict.reason === "attached" || verdict.reason === "steering") noProgressRepeats.delete(convKey)
                     else attempts = noteNoProgressRepeat(convKey, held.turn)
                     if (attempts == null || attempts < NO_PROGRESS_REPEAT_LIMIT) {
                       logBridgeEvent(held, held.turn, "reject_active", verdict.reason, acquireOpts,
@@ -5113,30 +6411,41 @@ export const AntigravityBridgePlugin = async () => {
                 }
               }
 
-              const { proc, history } = await acquireProc(
+              const { proc, turn } = await acquireProc(
                 agy,
                 convKey,
                 acquireOpts,
                 isFresh,
                 resultBlocks.length > 0 && !keptSession,
+                begin,
               )
-              const turn = await begin(proc, history)
               return streamResponse(proc, turn, body, init.signal)
             } catch (error) {
               return jsonError(error.statusCode ?? 502, error.message, error.code, { noRetry: error.noRetry })
             }
-          },
+          }),
         }
       },
     },
     provider: {
       id: PROVIDER_ID,
       npm: NPM_ANTHROPIC,
-      models: async () => {
+      // Not an OpenCode hook: the adapter in opencode2.mjs reads the list
+      // once more when this background work ends.
+      warming: () => catalogWarming(),
+      models: async (_given, ctx) => inAccount(await homeOfAuth(ctx?.auth), async () => {
         const agy = findAgy()
         // Never force a refresh here: Magpie times models() out after about two seconds.
         const catalog = await loadModelCatalog(agy, { probeOffered: true })
         const out = {}
+        // Not the account's list yet: the static one (no agy, signed out,
+        // or agy hasn't answered), or Gemini alone while agy acp is still
+        // asked what it offers. magpie keeps the list it had and the
+        // user's picks with it; a cold host's short list dropped every
+        // other pick (Archivemylife on X: the picks didn't stick).
+        if (cachedModelCatalog.isFallback || (!acpOfferedModels && (modelCatalogRefreshPromise || offeredProbePromise))) {
+          out[Symbol.for("magpie.fellBack")] = true
+        }
         for (const model of catalog.models) {
           const imageModel = /^(?:gemini-|claude-)/.test(model.id)
           out[model.id] = {
@@ -5156,7 +6465,7 @@ export const AntigravityBridgePlugin = async () => {
           }
         }
         return out
-      },
+      }),
     },
   }
 }

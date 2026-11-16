@@ -2,35 +2,43 @@
   "upstream": {
     "repository": "https://github.com/magpie-community/plugins",
     "directory": "packages/agy-cli",
-    "baseline_version": "0.1.19",
-    "baseline_commit": "445f4143de5cb8a423fc277935ce163c0b2896a3",
-    "selected_fixes_through": "0.1.25",
-    "head_commit": "fc87cc8855172122e52ad4e459e5a4155e460b9d"
+    "baseline_version": "0.1.69",
+    "baseline_commit": "b35d4b35b2446bd929896ddeb58f3cb299e9e2d1",
+    "head_commit": "b35d4b35b2446bd929896ddeb58f3cb299e9e2d1"
   },
-  "local_version": "0.1.25-local.20261112.1",
+  "local_version": "0.1.69-local.20261116.1",
   "changes": [
-    "Preserve production session continuity and tool-result receipts",
-    "Use AGY transcript model-step usage with bounded fallback; ACP input and cache counters remain independent",
-    "Port 0.1.21 notice handling, 0.1.22 output/thinking accounting, and 0.1.24-25 Windows shims",
-    "Reject assistant prefills with incomplete parallel tool results",
-    "Upstream 0.1.20 SQLite accounting is not integrated: production uses transcript accounting; 0.1.23 is specific to that SQLite path"
+    "Merged upstream 0.1.69 changes onto 0.1.64 local customizations.",
+    "Upgrade all runtime modules to upstream 0.1.64 (including first-turn client system prompt placement, 400 fail-fast on turned-away prompts, isolated --gemini-dir, multi-model concurrency, run_command toolSummary conflict fix, and startup diagnostics/install support)",
+    "Preserve the local live tool-result plus assistant-prefill extension and incomplete parallel-result rejection",
+    "Adopt upstream MCP commit-aware delivery rather than duplicating results already committed to the kept session",
+    "Retain transcript-based model-step usage by default and independent ACP input/cache counters; SQLite accounting is available with transcript usage disabled",
+    "Retain opt-in raw ACP and response-usage diagnostics without logging message contents"
   ],
   "sha256": {
     "LICENSE": "46f74979a7382f51ececa310eb3f3bd2a04addcd2b4dc3e27721c8eada0a07bd",
-    "NOTICE.md": "3a3df6156e5665e9b1be2c023e088834bc2f467b6c1f9d91800214bedd3b06ff",
-    "README.en.md": "6626368eae664f2ce68b492d9074991fee793b843baad0df02c1eb291d5e8026",
-    "README.md": "2af616cc68af14ed940a0d2485951623ddf2fe40a83d6360bf0eb50f48d6ad51",
+    "NOTICE.md": "03eef18b44086846e449a30fa07b0fb85e2e52fcf2d418bc5f9e79410784de1e",
+    "README.en.md": "fe4b24b03ed8d786ae6130e7d6668a249333197e8665107437bc8cd1bb3df228",
+    "README.md": "699f184fee63e04482ed8035bb603d0fe6e0d0eb3dde5718c833aa640a0d3ca1",
+    "account.mjs": "9c527d3633776a8d1408fb4d682e8ba4dba67fcc9cd329df684d0f75c088c36a",
     "array-items.mjs": "3011ff536942008a83c290c33cda9f9fcb18c2db90cb7de810d7bd816e0aa563",
-    "cloak.mjs": "0b1eb82954fae76364b108adb20a769e10aeb811f052e5e6ab91b146b5c56ee1",
-    "index.mjs": "393ef2014f491cd0233c9fa17d7805c85333ed955ff3b427a84f0a5f100bdca8",
+    "cloak.mjs": "67983e6360e7fc7cd948f94a341a8effa5308319cc3b053e7af5c61f63899cca",
+    "import.mjs": "11d071e3be92627dd77ceb862c64300a28c7b3b3ea82cea6f38dd315327fc956",
+    "index.mjs": "3c35fa6afc7eb3a8b697fd5b3acb31293345900dda9dbe6cf33711b54e573ecb",
+    "install.mjs": "812d5a37e183178bc5423e0ab1f091abacdc896b4f7b198d4b84eafce8938651",
     "login.mjs": "8fc1aa0cd4f6b341db63a4916c3e0d405b9c325651c8fa2d560b1215fe5f4d78",
     "mcp-server.mjs": "b0ef3568cc4361108c3db2c7bde8e02646b6a7b8610b015e0e8f129e32f0f926",
+    "model-ids.mjs": "f88502cf30676f09dce692defe8d6522e5a6e954933f470fdc85ec186cc91c70",
     "opencode.mjs": "393d67697ed13d7985f46f15da9e46654085145be848a93a31cbf7174771e232",
-    "opencode2.mjs": "2fdc96a5b5a6e3d0528b625b0e8e5e4cd29324bc013e198d188d3840c6beaf51",
-    "package.json": "5fbf3dd5a511cb657bdb3238f5fd250a19276cd62291b5a9b8d41581ca1226bf",
-    "platform.mjs": "d02e3808844f42e3e81cadb622594c688596a9ad9cd4d8a2a3713d1a79bfcf69",
+    "opencode2.mjs": "062365696c3d64a6526f6514093a315ecb4d14be738ab779ffaf2394c4ead900",
+    "package.json": "b67094effd83039eeb80ee4888ba6977b34125f1c80b50045395fb8f92cd833e",
+    "platform.mjs": "af2ec7521d5d03289e73c3c882c37568e64c4c70212060fff63e3e563fbd938c",
     "re2-pattern.mjs": "fc404a4c8436bbeda00b0872c523b8472fcb31418a10d8b35d8107f687c8896f",
+    "signin.mjs": "ca5f90f126a6d5b4e2f8aa3438b213c57ee3e5d4e706746064fa95b3ccc8c020",
+    "step-usage.mjs": "cf96f04c4bb8bbe8b242061d6cdf8f8016933d3790974e55de67854b5b916339",
+    "tool-budget.mjs": "df757606bc45bae1274b164cae7596945be9f5f1546ecbcfb174e54c2fbac4d4",
+    "tool-schema.mjs": "54e367e030555fd6dff6c3b2e25a4b5286b405a8ee209cb2d332a5e0b7c900bb",
     "transcript-usage.mjs": "d2d4d2b4acc9fa9b7ec6493b012f1e6804826fe7888cb18741888c99a35422a8",
-    "usage.mjs": "e9972f15b3975cdf0b35e97b179ba4e149a5779c604ea5c30049846da742e4df"
+    "usage.mjs": "bb385693b562e7d246000c9c03545a5f87ba0c093529f5f6434d6a04a4e0d2f0"
   }
 }

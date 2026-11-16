@@ -45,7 +45,9 @@ const RUNTIME_PRELUDE = `import { ${RUNTIME_NAMES.join(", ")} } from ${JSON.stri
 const TEST_EXPORTS = "\nexport { Turn as __agyTestTurn, allProcs as __agyTestAllProcs, pool as __agyTestPool, " +
   "execOnce as __agyTestExecOnce, findAgy as __agyTestFindAgy, canonicalBody as __agyTestCanonicalBody, " +
   "conversationKey as __agyTestConversationKey, renderInitialPromptParts as __agyTestRenderInitialPromptParts, " +
-  "normalizeAcpUsage as __agyTestNormalizeAcpUsage, inspectToolTurn as __agyTestInspectToolTurn };\n"
+  "normalizeAcpUsage as __agyTestNormalizeAcpUsage, inspectToolTurn as __agyTestInspectToolTurn, " +
+  "park as __agyTestPark, takeParked as __agyTestTakeParked, historyKey as __agyTestHistoryKey, " +
+  "instructionsIdentity as __agyTestInstructionsIdentity };\n"
 const IDENTIFIER_RE = /^[A-Za-z_$][\w$]*$/
 
 if (typeof vm.SourceTextModule !== "function" || typeof vm.SyntheticModule !== "function") {
@@ -400,6 +402,7 @@ export async function createBridgeKit(options = {}) {
     children: new Set(),
     modelsSpawns: [],
     acpSpawns: [],
+    helpSpawns: [],
     modelsBehavior: options.modelsBehavior ?? { stdout: modelsOutput(BASE_MODEL_ROWS) },
     prompts: [],
     promptSerial: 0,
@@ -439,6 +442,15 @@ export async function createBridgeKit(options = {}) {
   })
   const spawn = (file, args = [], opts = {}) => {
     if (args[0] === "models") return spawnModels(kit, file, args)
+    if (args[0] === "acp" && args.includes("--help")) {
+      kit.helpSpawns.push({ file, args })
+      const child = new FakeChild(kit, file, args)
+      setImmediate(() => {
+        if (options.acpHelp) child.stderr.emit("data", options.acpHelp)
+        child.finish(0)
+      })
+      return child
+    }
     if (args[0] === "acp") {
       const child = new FakeChild(kit, file, args)
       kit.acpSpawns.push({ file, args, env: opts.env })
@@ -489,7 +501,7 @@ export async function createBridgeKit(options = {}) {
     if (key === "./usage.mjs") module = sourceModule(USAGE_FILE, "", usageUrl)
     else if (key === "./platform.mjs") module = sourceModule(PLATFORM_FILE, "", platformUrl)
     else if (key === "./login.mjs") module = sourceModule(LOGIN_FILE, "", loginUrl)
-    else if (/^\.\/(?:transcript-usage|array-items|cloak|re2-pattern)\.mjs$/.test(key)) {
+    else if (/^\.\/(?:transcript-usage|array-items|cloak|re2-pattern|tool-schema|tool-budget|step-usage|signin|install|account|import|model-ids)\.mjs$/.test(key)) {
       const file = path.join(REPO_DIR, key.slice(2))
       module = sourceModule(file, "", pathToFileURL(file).href)
     }

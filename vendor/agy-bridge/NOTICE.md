@@ -88,3 +88,18 @@ A1–A16、U1–U6 逐项并入。两边都有、且 `acb8d84` 写法更新的�
 3. **内部状态不变**：会话停车文件仍在 `magpie-agy-bridge/sessions.json`，已有会话可以续接。
 4. **切换顺序**：先安装新包，确认新 provider 能返回 200，再逐个改模型名；旧包最后移除。
    本仓内不执行切换操作。
+
+## 8. 本适配服务的 0.1.49 定制版
+
+2026-11-14 更新至 `magpie-community/plugins@1c3c58be56ebdbcdac38a30e6f733e125573ab04`
+的 `packages/agy-cli`（0.1.49），定制版本号为 `0.1.49-local.20261114.1`。
+
+- 纳入新的系统提示词改写、拒绝请求提前失败、旧会话指令指纹校验、工具目录预算和 MCP 提交等待逻辑。
+- 保留 `transcript-usage.mjs`，默认使用本地 transcript 统计模型调用；ACP 未缓存输入和缓存读取仍分别计数。
+- 保留工具结果后接助手预填续写的扩展，并拒绝未返回全部并行工具结果的续写。
+- 已通过 MCP 提交的结果不再重复放入下一条提示词；更换会话时由上下文重放携带结果。
+- 精确来源和文件校验值见上一级的 `provenance.json`。
+
+## 9. 本适配服务的 0.1.69 定制版
+
+基于 `magpie-community/plugins@b35d4b35b2446bd929896ddeb58f3cb299e9e2d1` 的 `packages/agy-cli`（0.1.69），保留上节所述续接和用量统计定制。精确文件校验值见 `vendor/provenance.json`。

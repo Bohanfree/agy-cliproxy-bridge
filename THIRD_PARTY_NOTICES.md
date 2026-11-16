@@ -3,8 +3,8 @@
 ## Vendored AGY ACP bridge
 
 `vendor/agy-bridge/` contains a patched copy of the MIT-licensed
-`@magpie-community/opencode-agy-cli-auth` package, based on 0.1.19
-with selected fixes through 0.1.25.
+`@magpie-community/opencode-agy-cli-auth` package, based on upstream 0.1.69
+with local continuation and transcript-accounting adaptations.
 
 - Package repository: https://github.com/magpie-community/plugins/tree/main/packages/agy-cli
 - Original bridge: https://github.com/DylanLIiii/opencode-antigravity-bridge
