@@ -4,11 +4,15 @@ import {createBridgeKit} from './support/bridge-kit.mjs';
 
 const kit = await createBridgeKit();
 const textOf = value => value?.content?.filter(p => p.type === 'text').map(p => p.text).join('') || '';
+let lastReadResult = '';
 kit.defaultPrompt = async agent => {
   const prompt = agent.prompt.filter(p => p.type === 'text').map(p => p.text).join('');
   if (prompt.includes('FOLLOWUP_MARKER') || prompt.includes('PREFILL_MARKER')) {
-    const marker = /CPA_CONTINUATION_[a-f0-9-]+/.exec(prompt)?.[0];
-    if (!marker || !prompt.includes('[tool result')) throw new Error('Continuation lost the completed result');
+    // A completed result may be replayed in the prompt or already committed
+    // through MCP to the retained session before the continuation begins.
+    const marker = /CPA_CONTINUATION_[a-f0-9-]+/.exec(prompt)?.[0]
+      || /CPA_CONTINUATION_[a-f0-9-]+/.exec(lastReadResult)?.[0];
+    if (!marker) throw new Error('Continuation lost the completed result');
     await agent.text(`CONTINUATION_OK ${marker}`);
   } else {
     const match = /\{"input":"[^"\n]+","output":"[^"\n]+"\}/.exec(prompt);
@@ -17,7 +21,13 @@ kit.defaultPrompt = async agent => {
     const read = await agent.tool('read_file', {path: plan.input});
     const marker = textOf(read?.result || read);
     if (!marker) throw new Error('Client read result missing');
-    await agent.tool('write_file', {path: plan.output, content: marker});
+    lastReadResult = marker;
+    // A follow-up can cancel this prompt while its next tool call is waiting.
+    const cancelled = await Promise.race([
+      agent.tool('write_file', {path: plan.output, content: marker}).then(() => false),
+      agent.waitCancel().then(() => true),
+    ]);
+    if (cancelled) return {stopReason: 'cancelled'};
     await agent.text(`OFFLINE_PROTOCOL_OK ${marker}`);
   }
   return {stopReason: 'end_turn', usage: {inputTokens: 100, cachedReadTokens: 50, outputTokens: 10}};
